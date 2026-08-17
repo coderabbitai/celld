@@ -123,6 +123,42 @@ The bucket credentials give full control of the fleet. Keep them safe. The
 bucket contains the deployments, the SQLite replicas, the ownership
 records, the node leases, and the peer-authentication secret.
 
+### Export and restore a cell
+
+`cell export` reconstructs one cell at its latest durable transaction and
+writes a mode-`0600` SQLite archive plus a JSON manifest containing the cell,
+source epoch, source transaction ID, and database SHA-256:
+
+```sh
+celld cell export Knowledge:example \
+  --bucket "$CELLD_BUCKET" \
+  --output ./knowledge.sqlite
+```
+
+`cell import` creates a new cell lineage from an archive. It is an offline
+operator operation: it fails while any Celld node lease is live, refuses to
+replace an existing or differently sourced lineage, and uses an expiring
+staging claim so an interrupted import can be resumed safely:
+
+```sh
+celld cell import Knowledge:example \
+  --bucket "$CELLD_BUCKET" \
+  --input ./knowledge.sqlite \
+  --offline
+
+celld cell import Knowledge:example \
+  --bucket "$CELLD_BUCKET" \
+  --input ./knowledge.sqlite \
+  --offline \
+  --resume
+```
+
+Stop the whole fleet and wait for every node lease to expire before importing.
+Keep the same archive for `--resume`; a different archive cannot take over a
+staged or completed import. Start nodes only after the command reports the
+durable epoch and transaction ID. S3-compatible stores additionally use the
+same `--endpoint` and `--region` arguments as other Celld commands.
+
 A bucket value can add a key prefix: `s3://YOUR-BUCKET/PREFIX`. Every
 object of the fleet then goes below `PREFIX/`, so two fleets can share one
 bucket. A bucket value without a prefix keeps the objects at the root of
