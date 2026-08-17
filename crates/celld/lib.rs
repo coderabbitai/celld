@@ -26,6 +26,7 @@ pub mod fleet;
 pub mod js;
 pub mod ltx_repl;
 pub mod memory;
+pub mod metrics;
 mod otlp;
 pub mod ownership_store;
 pub mod peer_auth;

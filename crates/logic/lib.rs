@@ -156,8 +156,29 @@ pub enum Phase {
     Fenced,
 }
 
-/// The reported name of a phase. Stable across internal renames, because
-/// `/state` and `celld diagnose` publish it.
+/// The complete reported phase vocabulary. Names stay stable across internal
+/// renames because `/state`, `celld diagnose`, and operator metrics publish
+/// them.
+pub const STABLE_PHASE_NAMES: &[&str] = &[
+    "inactive",
+    "waiting_activation",
+    "reading_owner",
+    "reading_node_lease",
+    "reading_capacity",
+    "waiting_capacity",
+    "acquiring",
+    "reconciling_acquire",
+    "restoring",
+    "starting",
+    "publishing",
+    "ensuring_durability",
+    "cleaning",
+    "dormant",
+    "resident",
+    "remote",
+    "fenced",
+];
+
 fn phase_name(phase: &Phase) -> &'static str {
     match phase {
         Phase::Inactive => "inactive",
@@ -703,6 +724,17 @@ impl State {
             *counts.entry(phase_name(&cell.phase)).or_default() += 1;
         }
         counts.into_iter().collect()
+    }
+
+    /// Cumulative lifecycle decisions for bounded operator telemetry.
+    pub fn activity_snapshot(&self) -> ActivitySnapshot {
+        self.activity
+    }
+
+    /// The hard resident-cell admission ceiling. `usize::MAX` means the
+    /// operator left the ceiling unbounded.
+    pub fn max_resident(&self) -> usize {
+        self.config.max_resident
     }
 
     /// Cold routes that have not finished: cells that hold an activation

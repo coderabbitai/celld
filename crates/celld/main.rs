@@ -375,6 +375,9 @@ enum Message {
     Snapshot {
         reply: oneshot::Sender<String>,
     },
+    Metrics {
+        reply: oneshot::Sender<String>,
+    },
     Health {
         reply: oneshot::Sender<bool>,
     },
@@ -878,6 +881,16 @@ impl AppHandle {
         receive
             .await
             .unwrap_or_else(|_| "{\"error\":\"actor_stopped\"}".into())
+    }
+
+    async fn metrics(&self) -> String {
+        let (reply, receive) = oneshot::channel();
+        if self.tx.send(Message::Metrics { reply }).is_err() {
+            return "# celld actor stopped\n".into();
+        }
+        receive
+            .await
+            .unwrap_or_else(|_| "# celld actor stopped\n".into())
     }
 
     fn is_draining(&self) -> bool {
@@ -1505,6 +1518,9 @@ impl Actor {
             }
             Message::Snapshot { reply } => {
                 let _ = reply.send(self.state_json());
+            }
+            Message::Metrics { reply } => {
+                let _ = reply.send(self.metrics_text());
             }
             Message::Health { reply } => {
                 let _ = reply.send(self.state.ready_to_serve());
@@ -2323,6 +2339,33 @@ impl Actor {
         )
     }
 
+    fn metrics_text(&self) -> String {
+        let memory = celld::memory::sample();
+        let phases = self.state.phase_census();
+        let max_resident = self.state.max_resident();
+        celld::metrics::render(&celld::metrics::NodeMetrics {
+            runtime_version: env!("CARGO_PKG_VERSION"),
+            region: &self.region,
+            ownership: self.ownership.name(),
+            serving: self.state.ready_to_serve(),
+            occupied: self.state.occupied(),
+            resident_limit: (max_resident != usize::MAX).then_some(max_resident),
+            evicting: self.state.evicting(),
+            restoring: self.state.activation_backlog(),
+            activating: self.state.activating(),
+            activation_waiting: self.state.activation_waiting().len(),
+            capacity_waiting: self.state.waiting().len(),
+            phases: &phases,
+            shed_reason: self.state.shed_reason(),
+            rss_bytes: memory.rss_bytes,
+            in_use_bytes: memory.in_use_bytes,
+            output_gate_pending: self.gated_responses.len() + self.ws_gated.len(),
+            publishes: self.publishes,
+            stops: self.stops,
+            activity: self.state.activity_snapshot(),
+        })
+    }
+
     fn begin_route_if_cold(&mut self, cell: &str) {
         if !matches!(
             self.state.phase(cell),
@@ -2461,6 +2504,18 @@ fn response(status: StatusCode, body: impl Into<Bytes>) -> HttpReply {
                 .boxed_unsync(),
         )
         .expect("static HTTP response")
+}
+
+fn metrics_response(body: impl Into<Bytes>) -> HttpReply {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(
+            Full::new(body.into())
+                .map_err(|never| match never {})
+                .boxed_unsync(),
+        )
+        .expect("static metrics response")
 }
 
 fn asset_response(response: axum::response::Response) -> HttpReply {
@@ -3786,7 +3841,7 @@ async fn handle_internal(
     // but diagnostics is refused, and `Connection: close` tears the
     // keep-alive down so the drain loop can finish instead of holding every
     // idle connection open until the deadline.
-    if draining && !matches!(path.as_str(), "/__celld/probe" | "/state") {
+    if draining && !matches!(path.as_str(), "/__celld/probe" | "/state" | "/metrics") {
         let mut refused = response(
             StatusCode::SERVICE_UNAVAILABLE,
             "{\"ok\":false,\"draining\":true}",
@@ -3807,6 +3862,7 @@ async fn handle_internal(
     let result = match path.as_str() {
         "/__celld/probe" => internal_probe(request, app).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
+        "/metrics" => metrics_response(app.metrics().await),
         "/shutdown" if request.method() != hyper::Method::POST => {
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }

@@ -53,10 +53,19 @@ The sampler decides at the start of a request. An unsampled request
 records nothing and costs almost nothing. Under load, telemetry sheds
 before requests do, and celld counts what it sheds.
 
-celld records no metrics yet. This is a known gap, not a silent one:
-the spans carry the durations and the queue waits, so many questions
-a metric answers have an answer in the traces, and a metrics signal
-can come later without a change to the trace schema.
+The private operator listener exposes bounded node lifecycle metrics at
+`/metrics` in Prometheus text format. These gauges and counters cover serving,
+ownership, residency, activation, eviction, phase census, capacity headroom,
+memory, output-gate backlog, and cumulative ownership decisions. They contain
+no cell, request, tenant, or bucket identifiers. Keep the internal listener
+private and let a node-local collector scrape it. Every bounded phase and
+shedding-reason label is emitted on every scrape, including explicit zeroes,
+so a disappeared condition cannot look active through a stale series.
+
+Request latency, queue wait, bucket operation, and handler outcome remain trace
+signals rather than metrics. The spans carry those durations and outcomes, so
+derive their distributions in the OpenTelemetry backend without introducing a
+second sampling decision.
 
 ## Query the bucket with DuckDB
 
