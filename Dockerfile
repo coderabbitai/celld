@@ -5,6 +5,7 @@ ARG CELLD_COMMIT=unknown
 
 FROM rust:${RUST_VERSION}-bookworm AS build
 ARG TARGETARCH
+ARG CELLD_COMMIT
 # `release` for shipped artifacts; a fast-loop caller passes `lab` to skip
 # the fat-LTO relink and keep incremental state in the target cache.
 ARG CELLD_PROFILE=release
