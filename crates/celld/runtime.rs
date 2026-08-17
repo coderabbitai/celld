@@ -14,8 +14,7 @@ use crate::wake::WakeFlusher;
 use anyhow::{anyhow, Context};
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Once};
@@ -177,6 +176,51 @@ fn alarm_reporter(cells: &Arc<Mutex<CellRegistry>>, observe: &AlarmObserver) -> 
 struct CellRegistry {
     starting: HashMap<String, CellHandle>,
     published: HashMap<String, CellHandle>,
+    initializing: HashSet<String>,
+}
+
+impl CellRegistry {
+    fn reserve_initialization(&mut self, cell: &str) -> anyhow::Result<()> {
+        if self.starting.contains_key(cell)
+            || self.published.contains_key(cell)
+            || !self.initializing.insert(cell.to_string())
+        {
+            return Err(anyhow!(
+                "cell runtime already exists or is initializing: {cell}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct CellInitializationReservation {
+    cells: Arc<Mutex<CellRegistry>>,
+    cell: String,
+}
+
+impl CellInitializationReservation {
+    fn acquire(cells: &Arc<Mutex<CellRegistry>>, cell: &str) -> anyhow::Result<Self> {
+        cells
+            .lock()
+            .expect("cell registry poisoned")
+            .reserve_initialization(cell)?;
+        Ok(Self {
+            cells: cells.clone(),
+            cell: cell.to_string(),
+        })
+    }
+}
+
+impl Drop for CellInitializationReservation {
+    fn drop(&mut self) {
+        let removed = self
+            .cells
+            .lock()
+            .expect("cell registry poisoned")
+            .initializing
+            .remove(&self.cell);
+        debug_assert!(removed, "cell initialization reservation was lost");
+    }
 }
 
 #[derive(Clone)]
@@ -425,16 +469,11 @@ impl RuntimeManager {
         checkpoint_id: &str,
         target_cell: &str,
     ) -> anyhow::Result<crate::ltx_repl::ForkSeedManifest> {
-        let target_active = self.published_epoch(target_cell).is_some();
+        let _target_reservation = CellInitializationReservation::acquire(&self.cells, target_cell)?;
         self.replication
             .as_ref()
             .ok_or_else(|| anyhow!("forking requires durable replication"))?
-            .publish_fork_seed_from_checkpoint(
-                source_cell,
-                checkpoint_id,
-                target_cell,
-                target_active,
-            )
+            .publish_fork_seed_from_checkpoint(source_cell, checkpoint_id, target_cell, false)
             .await
     }
 
@@ -851,6 +890,8 @@ impl RuntimeManager {
 
     /// Materialize an isolate and retain it as non-routable until publication.
     pub async fn start_cell(&self, cell: String, epoch: u64, fresh: bool) -> anyhow::Result<()> {
+        let _initialization_reservation =
+            CellInitializationReservation::acquire(&self.cells, &cell)?;
         let db_path = self.db_path(&cell, epoch);
         let class = cell
             .split_once(':')
@@ -915,9 +956,6 @@ impl RuntimeManager {
 
         {
             let mut cells = self.cells.lock().expect("cell registry poisoned");
-            if cells.starting.contains_key(&cell) || cells.published.contains_key(&cell) {
-                return Err(anyhow!("cell runtime already exists: {cell}"));
-            }
             cells.starting.insert(
                 cell.clone(),
                 CellHandle {
@@ -2010,4 +2048,55 @@ pub(crate) async fn drive_cell(
 
 fn path_text(path: &Path) -> &str {
     path.to_str().expect("celld data path must be UTF-8")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CellInitializationReservation, CellRegistry};
+    use std::sync::{mpsc, Arc, Barrier, Mutex};
+    use std::thread;
+
+    #[test]
+    fn initialization_reservation_serializes_activation_and_fork_creation() {
+        let cells = Arc::new(Mutex::new(CellRegistry::default()));
+        let start = Arc::new(Barrier::new(3));
+        let release_winner = Arc::new(Barrier::new(2));
+        let (send, receive) = mpsc::channel();
+        let mut contenders = Vec::new();
+        for operation in ["activation", "fork"] {
+            let cells = cells.clone();
+            let start = start.clone();
+            let release_winner = release_winner.clone();
+            let send = send.clone();
+            contenders.push(thread::spawn(move || {
+                start.wait();
+                match CellInitializationReservation::acquire(&cells, "Class:target") {
+                    Ok(reservation) => {
+                        send.send((operation, true)).expect("report winner");
+                        release_winner.wait();
+                        drop(reservation);
+                    }
+                    Err(error) => {
+                        assert!(error
+                            .to_string()
+                            .contains("already exists or is initializing"));
+                        send.send((operation, false)).expect("report loser");
+                    }
+                }
+            }));
+        }
+        drop(send);
+        start.wait();
+
+        let outcomes = [receive.recv().unwrap(), receive.recv().unwrap()];
+        assert_eq!(outcomes.iter().filter(|(_, won)| *won).count(), 1);
+        assert_eq!(outcomes.iter().filter(|(_, won)| !*won).count(), 1);
+        release_winner.wait();
+        for contender in contenders {
+            contender.join().expect("contender did not panic");
+        }
+
+        CellInitializationReservation::acquire(&cells, "Class:target")
+            .expect("reservation is released after publication");
+    }
 }
