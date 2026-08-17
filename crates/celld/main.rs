@@ -4167,6 +4167,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     celld::memory::tune_allocator();
     let mut settings = match action_from_process()? {
         Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
+        Action::Cell(arguments) => return celld::cell_archive::run(arguments).await,
         Action::Connect(arguments) => {
             return celld::control_plane::handle_connect_command(arguments).await
         }

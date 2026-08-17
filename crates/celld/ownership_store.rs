@@ -184,6 +184,7 @@ impl BucketOwnership {
     }
 
     pub async fn read_owner(&self, cell: &str) -> anyhow::Result<Option<OwnerRecord>> {
+        crate::cell_archive::ensure_import_ready(&self.bucket, cell).await?;
         let key = format!("cells/{cell}/own.json");
         let Some((owner, etag)) = load_json::<OwnerWireOwned>(&self.bucket, &key).await? else {
             return Ok(None);
@@ -193,6 +194,19 @@ impl BucketOwnership {
             epoch: owner.epoch,
             etag,
         }))
+    }
+
+    /// Publish the initial unowned record for a fully staged import.
+    ///
+    /// This is deliberately absent-only. Import must never replace, rewind,
+    /// or join an existing authority lineage.
+    pub async fn create_import_owner(&self, cell: &str, epoch: u64) -> anyhow::Result<CasOutcome> {
+        let key = format!("cells/{cell}/own.json");
+        let body = serde_json::to_vec(&OwnerWire { node: "", epoch })?;
+        match self.bucket.put_cas(&key, body, None).await? {
+            Some(_) => Ok(CasOutcome::Applied),
+            None => Ok(CasOutcome::Rejected),
+        }
     }
 
     pub async fn read_node_lease(&self, owner: &str) -> anyhow::Result<Option<NodeLeaseRecord>> {

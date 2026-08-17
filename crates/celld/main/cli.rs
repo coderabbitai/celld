@@ -35,6 +35,7 @@ pub(crate) enum Action {
         read_only: bool,
     },
     Deploy(Vec<String>),
+    Cell(Vec<String>),
     Connect(Vec<String>),
     Credentials(Vec<String>),
     Token(Vec<String>),
@@ -49,6 +50,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
         let arguments = arguments[1..].to_vec();
         match action {
             "deploy" => return Ok(Action::Deploy(arguments)),
+            "cell" => return Ok(Action::Cell(arguments)),
             "connect" => return Ok(Action::Connect(arguments)),
             "credentials" => return Ok(Action::Credentials(arguments)),
             "token" => return Ok(Action::Token(arguments)),
@@ -224,6 +226,8 @@ pub(crate) fn print_help() {
 USAGE:
   celld --bucket [s3://|gs://]NAME[/PREFIX] [OPTIONS]
   celld deploy [PROJECT] --bucket [s3://|gs://]NAME[/PREFIX] [OPTIONS]
+  celld cell export CELL --output DATABASE --bucket [s3://|gs://]NAME[/PREFIX]
+  celld cell import CELL --input DATABASE --bucket [s3://|gs://]NAME[/PREFIX] --offline [--resume]
   celld diagnose --bucket [s3://|gs://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...
 
 Production install: celld --bucket s3://NAME [OPTIONS]

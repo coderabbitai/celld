@@ -9,6 +9,7 @@
 pub mod assets;
 pub mod asyncrt;
 pub mod bucket;
+pub mod cell_archive;
 pub mod control_plane;
 pub mod dead_node_gc;
 pub mod deploy;

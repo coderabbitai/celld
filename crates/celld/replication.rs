@@ -22,6 +22,7 @@ pub enum SyncWait {
 
 pub struct RestoredSnapshot {
     pub epoch: u64,
+    pub txid: Option<u64>,
     path: PathBuf,
     directory: PathBuf,
 }
@@ -33,9 +34,10 @@ impl RestoredSnapshot {
 
     /// Construct a snapshot whose `directory` is removed on drop, handing the
     /// caller an inspection copy with RAII cleanup.
-    pub(crate) fn new(epoch: u64, path: PathBuf, directory: PathBuf) -> Self {
+    pub(crate) fn new(epoch: u64, txid: Option<u64>, path: PathBuf, directory: PathBuf) -> Self {
         Self {
             epoch,
+            txid,
             path,
             directory,
         }
@@ -138,12 +140,24 @@ pub(crate) fn sqlite_snapshot(
     source: &std::path::Path,
     destination: &std::path::Path,
 ) -> anyhow::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    drop(options.open(destination)?);
+    let result = (|| -> anyhow::Result<()> {
         let source =
             Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let mut destination = Connection::open(destination)?;
         let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
         backup.run_to_completion(64, Duration::from_millis(5), None)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(destination);
     }
-    Ok(())
+    result
 }
