@@ -330,6 +330,28 @@ impl Replication {
         self.ltx.restore_snapshot(cell).await
     }
 
+    pub async fn publish_checkpoint(
+        &self,
+        cell: &str,
+        epoch: u64,
+        checkpoint_id: &str,
+    ) -> anyhow::Result<crate::ltx_repl::ForkSeedManifest> {
+        self.ltx
+            .publish_checkpoint(cell, epoch, checkpoint_id)
+            .await
+    }
+
+    pub async fn publish_fork_seed_from_checkpoint(
+        &self,
+        source_cell: &str,
+        checkpoint_id: &str,
+        target_cell: &str,
+    ) -> anyhow::Result<crate::ltx_repl::ForkSeedManifest> {
+        self.ltx
+            .publish_fork_seed_from_checkpoint(source_cell, checkpoint_id, target_cell)
+            .await
+    }
+
     async fn ensure_durable(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
         match self.sync_wait(cell, epoch).await {
             SyncWait::Durable => {}
@@ -374,6 +396,34 @@ impl RuntimeManager {
 
     pub fn region(&self) -> &str {
         &self.region
+    }
+
+    pub async fn publish_checkpoint(
+        &self,
+        cell: &str,
+        checkpoint_id: &str,
+    ) -> anyhow::Result<crate::ltx_repl::ForkSeedManifest> {
+        let epoch = self
+            .published_epoch(cell)
+            .ok_or_else(|| anyhow!("checkpoint source is not published: {cell}"))?;
+        self.replication
+            .as_ref()
+            .ok_or_else(|| anyhow!("checkpointing requires durable replication"))?
+            .publish_checkpoint(cell, epoch, checkpoint_id)
+            .await
+    }
+
+    pub async fn publish_fork_seed_from_checkpoint(
+        &self,
+        source_cell: &str,
+        checkpoint_id: &str,
+        target_cell: &str,
+    ) -> anyhow::Result<crate::ltx_repl::ForkSeedManifest> {
+        self.replication
+            .as_ref()
+            .ok_or_else(|| anyhow!("forking requires durable replication"))?
+            .publish_fork_seed_from_checkpoint(source_cell, checkpoint_id, target_cell)
+            .await
     }
 
     /// A deployment with no Durable Object classes can never land a Worker fetch

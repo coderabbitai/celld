@@ -35,6 +35,8 @@ use celld_ltx::ObjectStoreClient;
 use celld_ltx::ObjectStoreConfig;
 use celld_ltx::Replica;
 use celld_ltx::TXID;
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use tokio::sync::Semaphore;
@@ -67,6 +69,18 @@ const COMPACTION_MAX_FILES: usize = 256;
 /// The current `ReplicaClient` interface buffers objects, so bound the complete
 /// input set until the client gains a streaming read and write surface.
 const COMPACTION_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+
+const FORK_SEED_FORMAT: &str = "celld-sqlite-fork-seed-v1";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ForkSeedManifest {
+    pub format: String,
+    pub checkpoint_id: String,
+    pub source_cell: String,
+    pub source_epoch: u64,
+    pub sqlite_sha256: String,
+    pub sqlite_bytes: u64,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct CompactionConfig {
@@ -140,7 +154,7 @@ pub struct LtxRepl {
 impl LtxRepl {
     /// Private-corpus constructor over an injected store, so the epoch-seal
     /// protocol runs against an in-memory bucket instead of S3.
-    #[cfg(all(test, celld_internal_tests))]
+    #[cfg(test)]
     pub fn start_with_store_for_test(watch: &Path, store: Arc<dyn ObjectStore>) -> Self {
         let cells: Arc<Mutex<HashMap<(String, u64), CellHandle>>> = Arc::default();
         let dirty = Arc::new(Notify::new());
@@ -285,6 +299,240 @@ impl LtxRepl {
     /// prefix listing never mistakes it for an epoch.
     fn seal_key(&self, cell: &str, epoch: u64) -> String {
         format!("{}cells/{cell}/ltx/e{epoch}.seal.json", self.prefix)
+    }
+
+    fn fork_seed_key(&self, cell: &str, name: &str) -> String {
+        format!("{}cells/{cell}/fork-seed/{name}", self.prefix)
+    }
+
+    fn checkpoint_key(&self, cell: &str, checkpoint: &str, name: &str) -> String {
+        format!(
+            "{}cells/{cell}/checkpoints/{checkpoint}/{name}",
+            self.prefix
+        )
+    }
+
+    async fn put_fork_seed_object(
+        &self,
+        cell: &str,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        use celld_ltx::object_store::path::Path as ObjPath;
+        use celld_ltx::object_store::{PutMode, PutOptions, PutPayload};
+
+        let key = ObjPath::from(self.fork_seed_key(cell, name));
+        let create = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        match self
+            .store
+            .put_opts(&key, PutPayload::from(bytes.clone()), create)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(celld_ltx::object_store::Error::AlreadyExists { .. }) => {
+                let existing = self.store.get(&key).await?.bytes().await?;
+                anyhow::ensure!(
+                    existing.as_ref() == bytes,
+                    "fork seed target {cell} already contains a different {name}"
+                );
+                Ok(())
+            }
+            Err(error) => Err(anyhow!("publish fork seed {cell}/{name}: {error}")),
+        }
+    }
+
+    /// Publish a content-verified immutable checkpoint of the active cell.
+    pub async fn publish_checkpoint(
+        &self,
+        source_cell: &str,
+        source_epoch: u64,
+        checkpoint_id: &str,
+    ) -> anyhow::Result<ForkSeedManifest> {
+        anyhow::ensure!(
+            celld_logic::cell::valid_cell_scope(source_cell)
+                && celld_logic::cell::valid_cell_scope(checkpoint_id),
+            "invalid checkpoint coordinate"
+        );
+        let snapshot = self
+            .snapshot_active(source_cell, source_epoch)?
+            .ok_or_else(|| anyhow!("fork source is not active on this node"))?;
+        let sqlite = std::fs::read(snapshot.path())?;
+        let manifest = ForkSeedManifest {
+            format: FORK_SEED_FORMAT.to_string(),
+            checkpoint_id: checkpoint_id.to_string(),
+            source_cell: source_cell.to_string(),
+            source_epoch,
+            sqlite_sha256: format!("{:x}", Sha256::digest(&sqlite)),
+            sqlite_bytes: sqlite.len() as u64,
+        };
+        let encoded_manifest = serde_json::to_vec(&manifest)?;
+        self.put_checkpoint_object(source_cell, checkpoint_id, "database.sqlite", sqlite)
+            .await?;
+        self.put_checkpoint_object(
+            source_cell,
+            checkpoint_id,
+            "manifest.json",
+            encoded_manifest,
+        )
+        .await?;
+        Ok(manifest)
+    }
+
+    async fn put_checkpoint_object(
+        &self,
+        cell: &str,
+        checkpoint: &str,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        use celld_ltx::object_store::path::Path as ObjPath;
+        use celld_ltx::object_store::{PutMode, PutOptions, PutPayload};
+
+        let key = ObjPath::from(self.checkpoint_key(cell, checkpoint, name));
+        let create = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        match self
+            .store
+            .put_opts(&key, PutPayload::from(bytes.clone()), create)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(celld_ltx::object_store::Error::AlreadyExists { .. }) => {
+                let existing = self.store.get(&key).await?.bytes().await?;
+                anyhow::ensure!(
+                    existing.as_ref() == bytes,
+                    "checkpoint {cell}/{checkpoint} already contains a different {name}"
+                );
+                Ok(())
+            }
+            Err(error) => Err(anyhow!(
+                "publish checkpoint {cell}/{checkpoint}/{name}: {error}"
+            )),
+        }
+    }
+
+    async fn read_checkpoint(
+        &self,
+        source_cell: &str,
+        checkpoint_id: &str,
+    ) -> anyhow::Result<(ForkSeedManifest, Vec<u8>)> {
+        use celld_ltx::object_store::path::Path as ObjPath;
+
+        let manifest_key =
+            ObjPath::from(self.checkpoint_key(source_cell, checkpoint_id, "manifest.json"));
+        let manifest: ForkSeedManifest =
+            serde_json::from_slice(&self.store.get(&manifest_key).await?.bytes().await?)?;
+        anyhow::ensure!(
+            manifest.format == FORK_SEED_FORMAT,
+            "unsupported checkpoint format"
+        );
+        anyhow::ensure!(
+            manifest.source_cell == source_cell && manifest.checkpoint_id == checkpoint_id,
+            "checkpoint coordinates do not match its manifest"
+        );
+        let database_key =
+            ObjPath::from(self.checkpoint_key(source_cell, checkpoint_id, "database.sqlite"));
+        let sqlite = self.store.get(&database_key).await?.bytes().await?.to_vec();
+        anyhow::ensure!(
+            sqlite.len() as u64 == manifest.sqlite_bytes,
+            "checkpoint byte count mismatch"
+        );
+        anyhow::ensure!(
+            format!("{:x}", Sha256::digest(&sqlite)) == manifest.sqlite_sha256,
+            "checkpoint hash mismatch"
+        );
+        Ok((manifest, sqlite))
+    }
+
+    /// Seed a never-before-activated target from one immutable checkpoint.
+    /// The ready manifest is last so first activation fails closed if copying
+    /// is interrupted. Every write is create-or-verify for exact retry.
+    pub async fn publish_fork_seed_from_checkpoint(
+        &self,
+        source_cell: &str,
+        checkpoint_id: &str,
+        target_cell: &str,
+    ) -> anyhow::Result<ForkSeedManifest> {
+        anyhow::ensure!(
+            source_cell != target_cell,
+            "fork source and target must differ"
+        );
+        anyhow::ensure!(
+            celld_logic::cell::valid_cell_scope(source_cell)
+                && celld_logic::cell::valid_cell_scope(checkpoint_id)
+                && celld_logic::cell::valid_cell_scope(target_cell),
+            "invalid fork coordinate"
+        );
+        let (manifest, sqlite) = self.read_checkpoint(source_cell, checkpoint_id).await?;
+        let encoded_manifest = serde_json::to_vec(&manifest)?;
+        self.put_fork_seed_object(target_cell, "reserved.json", encoded_manifest.clone())
+            .await?;
+        self.put_fork_seed_object(target_cell, "database.sqlite", sqlite)
+            .await?;
+        self.put_fork_seed_object(target_cell, "ready.json", encoded_manifest)
+            .await?;
+        Ok(manifest)
+    }
+
+    async fn restore_fork_seed(&self, cell: &str, destination: &Path) -> anyhow::Result<bool> {
+        use celld_ltx::object_store::path::Path as ObjPath;
+
+        let reservation = ObjPath::from(self.fork_seed_key(cell, "reserved.json"));
+        match self.store.head(&reservation).await {
+            Ok(_) => {}
+            Err(celld_ltx::object_store::Error::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(anyhow!("read fork reservation for {cell}: {error}")),
+        }
+        let ready = ObjPath::from(self.fork_seed_key(cell, "ready.json"));
+        let manifest: ForkSeedManifest = match self.store.get(&ready).await {
+            Ok(result) => serde_json::from_slice(&result.bytes().await?)?,
+            Err(celld_ltx::object_store::Error::NotFound { .. }) => {
+                anyhow::bail!("fork seed for {cell} is reserved but incomplete")
+            }
+            Err(error) => return Err(anyhow!("read fork manifest for {cell}: {error}")),
+        };
+        anyhow::ensure!(
+            manifest.format == FORK_SEED_FORMAT,
+            "unsupported fork seed format"
+        );
+        let database = ObjPath::from(self.fork_seed_key(cell, "database.sqlite"));
+        let sqlite = self.store.get(&database).await?.bytes().await?;
+        anyhow::ensure!(
+            sqlite.len() as u64 == manifest.sqlite_bytes,
+            "fork seed byte count mismatch"
+        );
+        anyhow::ensure!(
+            format!("{:x}", Sha256::digest(&sqlite)) == manifest.sqlite_sha256,
+            "fork seed hash mismatch"
+        );
+        let temporary = destination.with_extension("fork-seed.tmp");
+        let _ = std::fs::remove_file(&temporary);
+        std::fs::write(&temporary, &sqlite)?;
+        // FTS5's integrity path may use SQLite's write machinery even though
+        // quick_check is logically read-only. Validate a private temporary
+        // copy with normal flags, then prove the main database bytes remain
+        // identical to the signed manifest before activation.
+        let connection = rusqlite::Connection::open(&temporary)?;
+        let quick_check: String =
+            connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            quick_check == "ok",
+            "fork seed SQLite quick_check failed: {quick_check}"
+        );
+        drop(connection);
+        let validated = std::fs::read(&temporary)?;
+        anyhow::ensure!(
+            validated.len() as u64 == manifest.sqlite_bytes
+                && format!("{:x}", Sha256::digest(&validated)) == manifest.sqlite_sha256,
+            "fork seed SQLite validation changed the database bytes"
+        );
+        std::fs::rename(temporary, destination)?;
+        Ok(true)
     }
 
     /// Read the source epoch's seal, writing it first if this activation is
@@ -434,6 +682,9 @@ impl LtxRepl {
         } else if let Some(snapshot) = local_snapshot {
             std::fs::rename(&snapshot, &dst)?;
             info!(cell, epoch, "reused local eviction snapshot");
+            restored = true;
+        } else if fresh && self.restore_fork_seed(cell, &dst).await? {
+            info!(cell, epoch, "restored immutable fork seed");
             restored = true;
         } else if !fresh {
             // Restore the newest durable epoch into this epoch's path — up to
@@ -1100,5 +1351,127 @@ fn node_config(
         session_token,
         skip_verify: false,
         part_size: 0,
+    }
+}
+
+#[cfg(test)]
+mod fork_seed_tests {
+    use super::*;
+    use celld_ltx::object_store::memory::InMemory;
+    use celld_ltx::object_store::path::Path as ObjPath;
+    use celld_ltx::object_store::PutPayload;
+
+    fn activation<'a>(cell: &'a str, fresh: bool) -> ActivationOptions<'a> {
+        ActivationOptions {
+            cell,
+            epoch: 1,
+            fresh,
+            took_over: false,
+            resume_local: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_seed_is_exact_create_only_and_independent() {
+        let directory = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let replication = LtxRepl::start_with_store_for_test(directory.path(), store);
+        let source = replication
+            .activate(activation("source", true))
+            .await
+            .unwrap();
+        {
+            let connection = rusqlite::Connection::open(&source.path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE state(key TEXT PRIMARY KEY, value TEXT NOT NULL);\n\
+                     INSERT INTO state VALUES ('phase', 'checkpointed');",
+                )
+                .unwrap();
+        }
+        replication.await_durable("source", 1, 1).await.unwrap();
+
+        let manifest = replication
+            .publish_checkpoint("source", 1, "checkpoint-1")
+            .await
+            .unwrap();
+        replication
+            .publish_fork_seed_from_checkpoint("source", "checkpoint-1", "fork")
+            .await
+            .unwrap();
+        assert_eq!(manifest.source_cell, "source");
+        assert_eq!(manifest.source_epoch, 1);
+        assert_eq!(manifest.checkpoint_id, "checkpoint-1");
+        assert_eq!(manifest.sqlite_sha256.len(), 64);
+        assert_eq!(
+            replication
+                .publish_fork_seed_from_checkpoint("source", "checkpoint-1", "fork")
+                .await
+                .unwrap(),
+            manifest
+        );
+
+        let source_connection = rusqlite::Connection::open(&source.path).unwrap();
+        source_connection
+            .execute(
+                "UPDATE state SET value = 'source-advanced' WHERE key = 'phase'",
+                [],
+            )
+            .unwrap();
+        drop(source_connection);
+        assert!(replication
+            .publish_checkpoint("source", 1, "checkpoint-1")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already contains a different database.sqlite"));
+
+        let fork = replication
+            .activate(activation("fork", true))
+            .await
+            .unwrap();
+        assert!(fork.restored);
+        let connection = rusqlite::Connection::open(&fork.path).unwrap();
+        let value: String = connection
+            .query_row("SELECT value FROM state WHERE key = 'phase'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(value, "checkpointed");
+        connection
+            .execute("UPDATE state SET value = 'forked' WHERE key = 'phase'", [])
+            .unwrap();
+        drop(connection);
+
+        let source_connection = rusqlite::Connection::open(&source.path).unwrap();
+        let source_value: String = source_connection
+            .query_row("SELECT value FROM state WHERE key = 'phase'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(source_value, "source-advanced");
+    }
+
+    #[tokio::test]
+    async fn incomplete_seed_never_activates_as_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        store
+            .put(
+                &ObjPath::from("cells/incomplete/fork-seed/reserved.json"),
+                PutPayload::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        let replication = LtxRepl::start_with_store_for_test(directory.path(), store);
+        let error = match replication.activate(activation("incomplete", true)).await {
+            Ok(_) => panic!("incomplete seed activated"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("reserved but incomplete"));
+        assert!(!directory
+            .path()
+            .join("incomplete/ltx/e1/db.sqlite")
+            .exists());
     }
 }

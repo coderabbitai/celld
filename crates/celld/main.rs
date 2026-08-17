@@ -62,6 +62,15 @@ static NEXT_CORE_REQUEST: AtomicU64 = AtomicU64::new(1);
 /// the complete shutdown grace.
 const CONNECTION_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+const CHECKPOINT_REQUEST_HEADER: &str = "x-celld-checkpoint-id";
+const CHECKPOINT_SOURCE_HEADER: &str = "x-celld-checkpoint-source";
+const CHECKPOINT_EPOCH_HEADER: &str = "x-celld-checkpoint-source-epoch";
+const CHECKPOINT_SHA256_HEADER: &str = "x-celld-checkpoint-sqlite-sha256";
+const CHECKPOINT_BYTES_HEADER: &str = "x-celld-checkpoint-sqlite-bytes";
+const FORK_SOURCE_HEADER: &str = "x-celld-fork-source";
+const FORK_CHECKPOINT_HEADER: &str = "x-celld-fork-checkpoint";
+const FORK_TARGET_HEADER: &str = "x-celld-fork-target";
+
 /// The lossy stdout writer's flush handle. Every exit path uses
 /// `std::process::exit`, which skips destructors — but the last lines before
 /// an exit are the fence forensics, exactly the lines that must survive.
@@ -2475,6 +2484,78 @@ fn peer_response(mut response: HttpReply) -> HttpReply {
     response
 }
 
+fn take_worker_header(response: &mut celld::js::HttpResponse, name: &str) -> Option<String> {
+    let index = response
+        .headers
+        .iter()
+        .position(|(candidate, _)| candidate.eq_ignore_ascii_case(name))?;
+    Some(response.headers.remove(index).1)
+}
+
+async fn fulfill_checkpoint_request(
+    runtime: &RuntimeManager,
+    scope: &str,
+    response: &mut celld::js::HttpResponse,
+) -> anyhow::Result<()> {
+    let Some(checkpoint_id) = take_worker_header(response, CHECKPOINT_REQUEST_HEADER) else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        (200..300).contains(&response.status),
+        "a failed Worker response cannot publish a checkpoint"
+    );
+    anyhow::ensure!(
+        response.stream.is_none() && response.ws.is_none(),
+        "a checkpoint response must be buffered and non-WebSocket"
+    );
+    let manifest = runtime.publish_checkpoint(scope, &checkpoint_id).await?;
+    response
+        .headers
+        .push((CHECKPOINT_SOURCE_HEADER.into(), manifest.source_cell));
+    response.headers.push((
+        CHECKPOINT_EPOCH_HEADER.into(),
+        manifest.source_epoch.to_string(),
+    ));
+    response
+        .headers
+        .push((CHECKPOINT_SHA256_HEADER.into(), manifest.sqlite_sha256));
+    response.headers.push((
+        CHECKPOINT_BYTES_HEADER.into(),
+        manifest.sqlite_bytes.to_string(),
+    ));
+    Ok(())
+}
+
+async fn fulfill_fork_request(
+    runtime: &RuntimeManager,
+    response: &mut celld::js::HttpResponse,
+) -> anyhow::Result<()> {
+    let source = take_worker_header(response, FORK_SOURCE_HEADER);
+    let checkpoint = take_worker_header(response, FORK_CHECKPOINT_HEADER);
+    let target = take_worker_header(response, FORK_TARGET_HEADER);
+    if source.is_none() && checkpoint.is_none() && target.is_none() {
+        return Ok(());
+    }
+    let (source, checkpoint, target) = match (source, checkpoint, target) {
+        (Some(source), Some(checkpoint), Some(target)) => (source, checkpoint, target),
+        _ => anyhow::bail!("incomplete Worker fork instruction"),
+    };
+    anyhow::ensure!(
+        (200..300).contains(&response.status),
+        "a failed Worker response cannot seed a fork"
+    );
+    anyhow::ensure!(
+        response.stream.is_none() && response.ws.is_none(),
+        "a fork response must be buffered and non-WebSocket"
+    );
+    let source = runtime.cell_scope(&source)?;
+    let target = runtime.cell_scope(&target)?;
+    runtime
+        .publish_fork_seed_from_checkpoint(&source, &checkpoint, &target)
+        .await?;
+    Ok(())
+}
+
 fn runtime_response(worker_response: celld::js::HttpResponse) -> HttpReply {
     let Ok(status) = StatusCode::from_u16(worker_response.status) else {
         return response(StatusCode::INTERNAL_SERVER_ERROR, "invalid Worker status");
@@ -2785,13 +2866,18 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                     // activity guard has not dropped), so it fails rather than
                     // acknowledges a write the node cannot prove durable.
                     let result = match result {
-                        Ok(response) => match response.write_position.filter(|_| app.output_gate) {
-                            Some(position) => match app.gate_write(request, position).await {
-                                Ok(()) => Ok(response),
-                                Err(error) => Err(anyhow::Error::new(RoutedRequestError(error))),
-                            },
-                            None => Ok(response),
-                        },
+                        Ok(mut response) => {
+                            if let Some(position) =
+                                response.write_position.filter(|_| app.output_gate)
+                            {
+                                app.gate_write(request, position).await.map_err(|error| {
+                                    anyhow::Error::new(RoutedRequestError(error))
+                                })?;
+                            }
+                            let runtime = app.runtime.as_ref().context("no cell runtime")?;
+                            fulfill_checkpoint_request(runtime, &scope, &mut response).await?;
+                            Ok(response)
+                        }
                         Err(error) => Err(error),
                     };
                     if let Some(timing) = websocket_timing.as_mut() {
@@ -3261,7 +3347,7 @@ async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) 
             };
             match runtime
                 .fetch_cell(
-                    scope,
+                    scope.clone(),
                     name,
                     RuntimeFetch {
                         url,
@@ -3278,7 +3364,7 @@ async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) 
                 )
                 .await
             {
-                Ok(worker_response) => {
+                Ok(mut worker_response) => {
                     abort.request_id = None;
                     // Output gate (RPO=0): a peer-served handler that advanced
                     // the cell's committed position holds its reply until the
@@ -3296,6 +3382,14 @@ async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) 
                                 format!("durability unproven: {error:?}"),
                             ));
                         }
+                    }
+                    if let Err(error) =
+                        fulfill_checkpoint_request(runtime, &scope, &mut worker_response).await
+                    {
+                        return peer_response(response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("checkpoint publication failed: {error:#}"),
+                        ));
                     }
                     if let Some(target) = &worker_response.ws {
                         let kind = if celld::js::ws_hibernatable(target.id).unwrap_or(false) {
@@ -3616,7 +3710,18 @@ async fn handle_ingress(
         .fetch_worker(url, method, body, headers, connection)
         .await
     {
-        Ok(worker_response) => runtime_response(worker_response),
+        Ok(mut worker_response) => {
+            let Some(runtime) = &app.runtime else {
+                return response(StatusCode::SERVICE_UNAVAILABLE, "no cell runtime");
+            };
+            if let Err(error) = fulfill_fork_request(runtime, &mut worker_response).await {
+                return response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("fork seed publication failed: {error:#}"),
+                );
+            }
+            runtime_response(worker_response)
+        }
         Err(error) => match error.downcast_ref::<celld::pool::AdmitError>() {
             // Saturation is not a failure of the request. Answering it now
             // lets the caller retry or shed; holding the connection until its
