@@ -61,7 +61,8 @@ connection.close()
 PY
 
 celld() {
-	docker run --rm --network "$NETWORK" -v "$TEST_ROOT:/archive" \
+	docker run --rm --network "$NETWORK" --user "$(id -u):$(id -g)" \
+		-v "$TEST_ROOT:/archive" \
 		-e "AWS_ACCESS_KEY_ID=$ACCESS_KEY" -e "AWS_SECRET_ACCESS_KEY=$SECRET_KEY" \
 		-e AWS_REGION=us-east-1 "$CELLD_IMAGE" "$@"
 }
