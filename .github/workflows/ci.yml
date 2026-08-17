@@ -21,4 +21,6 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Build the tested production image
-        run: docker build --build-arg CELLD_COMMIT="$GITHUB_SHA" --build-arg CELLD_VERSION="0.2.1-coderabbit" .
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
+          docker build --build-arg CELLD_COMMIT="$GITHUB_SHA" --build-arg CELLD_VERSION="$version" .

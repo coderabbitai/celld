@@ -78,22 +78,14 @@ A cell fits a workload that divides into named, stateful units:
 
 ## Install
 
-The installer downloads the `celld` binary. Replication occurs in the
-celld process. A node does not need an external replicator. If your
-project contains Worker code, `celld deploy` needs esbuild. An asset-only
-project does not need esbuild.
+Replication occurs in the celld process; a node does not need an external
+replicator. Use the release container or download an exact native binary from
+the [CodeRabbit fork releases](https://github.com/coderabbitai/celld/releases).
+Each release has a GitHub Actions build attestation. Verify a downloaded file
+with `gh attestation verify <asset> --repo coderabbitai/celld`.
 
-```sh
-curl -fsSL https://celld.dev/install.sh | sh
-```
-
-If the installer tells you, add `~/.local/bin` to `PATH`. To install one
-exact release, set `CELLD_VERSION` to the tag of that release, for example
-`v0.0.1`. To go back to a previous release, run the installer again with
-the tag of that release. The releases are on
-[GitHub](https://github.com/denoland/celld/releases). Each release has a
-GitHub Actions build attestation. To make sure that a downloaded file is
-correct, run `gh attestation verify <asset> --repo denoland/celld`.
+If your project contains Worker code, `celld deploy` needs esbuild. An
+asset-only project does not need esbuild.
 
 ## Configure object storage
 
@@ -149,7 +141,7 @@ If the project contains Worker code, install `esbuild` on `PATH`. Then run
 `celld deploy` from an applicable Wrangler project:
 
 ```sh
-git clone https://github.com/denoland/celld
+git clone https://github.com/coderabbitai/celld
 cd celld/examples/counter
 celld deploy . \
   --bucket "$CELLD_BUCKET" \

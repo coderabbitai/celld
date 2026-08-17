@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "celld"
-version = "0.2.1"
+version = "0.2.1-coderabbit.1"
 dependencies = [
  "aes",
  "aes-gcm",

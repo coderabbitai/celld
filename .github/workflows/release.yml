@@ -29,7 +29,7 @@ concurrency:
 
 env:
   RUST_VERSION: 1.97.1
-  IMAGE: ghcr.io/denoland/celld
+  IMAGE: ghcr.io/coderabbitai/celld
 
 jobs:
   build-celld:
@@ -302,7 +302,7 @@ jobs:
         if: github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: ghcr.io/denoland/celld
+          subject-name: ghcr.io/coderabbitai/celld
           subject-digest: ${{ steps.digest.outputs.digest }}
           push-to-registry: true
 
