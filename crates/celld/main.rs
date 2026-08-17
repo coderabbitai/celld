@@ -4133,7 +4133,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             } else {
                 ""
             };
-            println!("celld {}{profile}", env!("CARGO_PKG_VERSION"));
+            let commit = option_env!("CELLD_BUILD_COMMIT").unwrap_or("unknown");
+            println!(
+                "celld {}{profile} (commit {commit})",
+                env!("CARGO_PKG_VERSION")
+            );
             return Ok(());
         }
         Action::Diagnose {
