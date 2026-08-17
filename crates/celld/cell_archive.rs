@@ -15,6 +15,7 @@ use anyhow::{bail, Context};
 use celld_logic::CasOutcome;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 const ARCHIVE_VERSION: u32 = 1;
@@ -204,18 +205,27 @@ fn parse(arguments: Vec<String>) -> anyhow::Result<Command> {
             .unwrap_or_else(|| "us-east-1".to_string()),
     };
     match operation.as_str() {
-        "export" => Ok(Command::Export {
-            cell,
-            output: output.context("cell export requires --output DATABASE")?,
-            storage,
-        }),
-        "import" => Ok(Command::Import {
-            cell,
-            input: input.context("cell import requires --input DATABASE")?,
-            storage,
-            offline,
-            resume,
-        }),
+        "export" => {
+            anyhow::ensure!(
+                input.is_none() && !offline && !resume,
+                "cell export does not accept --input, --offline, or --resume"
+            );
+            Ok(Command::Export {
+                cell,
+                output: output.context("cell export requires --output DATABASE")?,
+                storage,
+            })
+        }
+        "import" => {
+            anyhow::ensure!(output.is_none(), "cell import does not accept --output");
+            Ok(Command::Import {
+                cell,
+                input: input.context("cell import requires --input DATABASE")?,
+                storage,
+                offline,
+                resume,
+            })
+        }
         _ => unreachable!(),
     }
 }
@@ -535,8 +545,17 @@ fn validate_sqlite(path: &Path) -> anyhow::Result<()> {
 }
 
 fn sha256_file(path: &Path) -> anyhow::Result<String> {
-    let bytes = std::fs::read(path)?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn manifest_path(database: &Path) -> PathBuf {
@@ -599,6 +618,39 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.to_string().contains("invalid cell scope"));
+    }
+
+    #[test]
+    fn rejects_options_owned_by_the_other_archive_operation() {
+        let export_error = parse(vec![
+            "export".into(),
+            "Org:test".into(),
+            "--output".into(),
+            "archive.sqlite".into(),
+            "--bucket".into(),
+            "bucket".into(),
+            "--resume".into(),
+        ])
+        .unwrap_err();
+        assert!(export_error
+            .to_string()
+            .contains("cell export does not accept"));
+
+        let import_error = parse(vec![
+            "import".into(),
+            "Org:test".into(),
+            "--input".into(),
+            "archive.sqlite".into(),
+            "--output".into(),
+            "ignored.sqlite".into(),
+            "--bucket".into(),
+            "bucket".into(),
+            "--offline".into(),
+        ])
+        .unwrap_err();
+        assert!(import_error
+            .to_string()
+            .contains("cell import does not accept --output"));
     }
 
     #[test]

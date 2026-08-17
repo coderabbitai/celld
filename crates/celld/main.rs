@@ -115,6 +115,19 @@ enum Ownership {
 }
 
 impl Ownership {
+    async fn read_owner_for_activation(&self, cell: &str) -> Result<Option<OwnerRecord>, Failure> {
+        match self {
+            Self::Memory(memory) => Ok(memory.lock().await.owners.get(cell).cloned()),
+            Self::Bucket(bucket) => bucket
+                .read_owner_for_activation(cell)
+                .await
+                .map_err(|error| {
+                    eprintln!("celld ownership activation read failed: {error:#}");
+                    Failure::Definite
+                }),
+        }
+    }
+
     async fn read_owner(&self, cell: &str) -> Result<Option<OwnerRecord>, Failure> {
         match self {
             Self::Memory(memory) => Ok(memory.lock().await.owners.get(cell).cloned()),
@@ -1799,7 +1812,7 @@ impl Actor {
                 let timing_cell = cell.clone();
                 in_flight.push(Box::pin(async move {
                     let started = Instant::now();
-                    let result = ownership.read_owner(&cell).await;
+                    let result = ownership.read_owner_for_activation(&cell).await;
                     CompletedEffect::timed(
                         Event::OwnerRead {
                             op,

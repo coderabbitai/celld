@@ -460,7 +460,7 @@ pub async fn restore_with_download_slots<C: ReplicaClient>(
     let mut stats = RestorePlanStats {
         objects: infos.len(),
         bytes: infos.iter().map(|info| info.size.max(0) as u64).sum(),
-        max_txid: infos.iter().map(|info| info.max_txid.0).max().unwrap_or(0),
+        max_txid: slice_max_txid(&infos).0,
         by_level: BTreeMap::new(),
     };
     for info in &infos {

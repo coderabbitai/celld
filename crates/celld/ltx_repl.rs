@@ -15,6 +15,7 @@
 //! one bucket would replicate over each other.
 
 use std::collections::HashMap;
+use std::io::{BufReader, Read};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -670,9 +671,14 @@ impl LtxRepl {
         cell: &str,
         epoch: u64,
     ) -> anyhow::Result<Option<u64>> {
-        let plan = replica::calc_restore_plan(&self.client_for(cell, epoch), TXID(0))
-            .await
-            .with_context(|| format!("plan durable position for {cell} e{epoch}"))?;
+        let plan = match replica::calc_restore_plan(&self.client_for(cell, epoch), TXID(0)).await {
+            Ok(plan) => plan,
+            Err(celld_ltx::Error::TxNotAvailable) => return Ok(None),
+            Err(error) => {
+                return Err(anyhow!(error))
+                    .with_context(|| format!("plan durable position for {cell} e{epoch}"));
+            }
+        };
         Ok(plan.iter().map(|info| info.max_txid.0).max())
     }
 
@@ -746,7 +752,7 @@ impl LtxRepl {
         sqlite_snapshot(&path, &expected).context("normalize captured import for comparison")?;
         sqlite_snapshot(&restored, &actual).context("normalize restored import for comparison")?;
         anyhow::ensure!(
-            std::fs::read(&expected)? == std::fs::read(&actual)?,
+            files_equal(&expected, &actual)?,
             "import LTX round trip does not match the staged SQLite database"
         );
         let _ = std::fs::remove_dir_all(&directory);
@@ -853,6 +859,26 @@ impl LtxRepl {
     /// long as celld is running.
     pub fn process_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
         Ok(None)
+    }
+}
+
+fn files_equal(left: &Path, right: &Path) -> std::io::Result<bool> {
+    if std::fs::metadata(left)?.len() != std::fs::metadata(right)?.len() {
+        return Ok(false);
+    }
+    let mut left = BufReader::new(std::fs::File::open(left)?);
+    let mut right = BufReader::new(std::fs::File::open(right)?);
+    let mut left_buffer = [0_u8; 64 * 1024];
+    let mut right_buffer = [0_u8; 64 * 1024];
+    loop {
+        let left_read = left.read(&mut left_buffer)?;
+        let right_read = right.read(&mut right_buffer)?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
     }
 }
 

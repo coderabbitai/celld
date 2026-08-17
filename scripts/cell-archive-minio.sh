@@ -17,8 +17,10 @@ readonly MINIO="${RUN_ID}-minio"
 TEST_ROOT="$(mktemp -d /tmp/celld-archive.XXXXXX)"
 readonly TEST_ROOT
 readonly ENDPOINT='http://minio:9000'
-readonly ACCESS_KEY='celldtest'
-readonly SECRET_KEY='celldtestsecret'
+ACCESS_KEY="celld$(printf '%s' "$RUN_ID-access" | shasum -a 256 | cut -c1-12)"
+readonly ACCESS_KEY
+SECRET_KEY="$(printf '%s' "$RUN_ID-secret" | shasum -a 256 | cut -c1-32)"
+readonly SECRET_KEY
 export TEST_ROOT
 
 if [[ "$BACKEND" != 'minio' && "$BACKEND" != 'gcs' ]]; then
@@ -93,6 +95,15 @@ object_put() {
 		cat > "$input_file"
 		gcloud storage cp "$input_file" "gs://$GCS_BUCKET/fleet/$key" >/dev/null
 		rm -f "$input_file"
+	fi
+}
+
+object_prefix_exists() {
+	local prefix="$1"
+	if [[ "$BACKEND" == 'minio' ]]; then
+		[[ -n "$(mc "mc find local/celld-archive/fleet/$prefix" 2>/dev/null)" ]]
+	else
+		gcloud storage ls --recursive "gs://$GCS_BUCKET/fleet/$prefix/**" >/dev/null 2>&1
 	fi
 }
 
@@ -246,5 +257,9 @@ if celld cell import Knowledge:blocked --input "$archive_root/source.sqlite" \
 	exit 1
 fi
 grep -F 'live celld node lease(s): live-test' "$TEST_ROOT/live.log" >/dev/null
+if object_prefix_exists 'cells/Knowledge:blocked'; then
+	echo 'failed live-fleet import created target marker, owner, or LTX state' >&2
+	exit 1
+fi
 
 echo "cell archive $BACKEND test passed"
