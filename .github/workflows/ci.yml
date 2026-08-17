@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned Rust formatter
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt
+          rustup default 1.97.1
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Build the tested production image
+        run: docker build --build-arg CELLD_COMMIT="$GITHUB_SHA" --build-arg CELLD_VERSION="0.2.1-coderabbit" .
