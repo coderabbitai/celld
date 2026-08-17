@@ -330,7 +330,7 @@ impl Replication {
         self.ltx.restore_snapshot(cell).await
     }
 
-    pub async fn publish_checkpoint(
+    async fn publish_checkpoint(
         &self,
         cell: &str,
         epoch: u64,
@@ -341,14 +341,20 @@ impl Replication {
             .await
     }
 
-    pub async fn publish_fork_seed_from_checkpoint(
+    async fn publish_fork_seed_from_checkpoint(
         &self,
         source_cell: &str,
         checkpoint_id: &str,
         target_cell: &str,
+        target_active: bool,
     ) -> anyhow::Result<crate::ltx_repl::ForkSeedManifest> {
         self.ltx
-            .publish_fork_seed_from_checkpoint(source_cell, checkpoint_id, target_cell)
+            .publish_fork_seed_from_checkpoint(
+                source_cell,
+                checkpoint_id,
+                target_cell,
+                target_active,
+            )
             .await
     }
 
@@ -419,10 +425,16 @@ impl RuntimeManager {
         checkpoint_id: &str,
         target_cell: &str,
     ) -> anyhow::Result<crate::ltx_repl::ForkSeedManifest> {
+        let target_active = self.published_epoch(target_cell).is_some();
         self.replication
             .as_ref()
             .ok_or_else(|| anyhow!("forking requires durable replication"))?
-            .publish_fork_seed_from_checkpoint(source_cell, checkpoint_id, target_cell)
+            .publish_fork_seed_from_checkpoint(
+                source_cell,
+                checkpoint_id,
+                target_cell,
+                target_active,
+            )
             .await
     }
 

@@ -2485,11 +2485,18 @@ fn peer_response(mut response: HttpReply) -> HttpReply {
 }
 
 fn take_worker_header(response: &mut celld::js::HttpResponse, name: &str) -> Option<String> {
-    let index = response
-        .headers
-        .iter()
-        .position(|(candidate, _)| candidate.eq_ignore_ascii_case(name))?;
-    Some(response.headers.remove(index).1)
+    let mut first = None;
+    response.headers.retain(|(candidate, value)| {
+        if candidate.eq_ignore_ascii_case(name) {
+            if first.is_none() {
+                first = Some(value.clone());
+            }
+            false
+        } else {
+            true
+        }
+    });
+    first
 }
 
 async fn fulfill_checkpoint_request(
@@ -3715,9 +3722,10 @@ async fn handle_ingress(
                 return response(StatusCode::SERVICE_UNAVAILABLE, "no cell runtime");
             };
             if let Err(error) = fulfill_fork_request(runtime, &mut worker_response).await {
+                tracing::warn!(%error, "fork seed publication failed");
                 return response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("fork seed publication failed: {error:#}"),
+                    "fork seed publication failed",
                 );
             }
             runtime_response(worker_response)
@@ -5228,5 +5236,35 @@ impl Drop for AbortPeerFetchOnHangUp {
         if let Some(request_id) = self.request_id {
             self.runtime.abort_fetch(&self.scope, request_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod worker_header_tests {
+    use super::*;
+
+    #[test]
+    fn control_header_extraction_removes_every_duplicate() {
+        let mut response = celld::js::HttpResponse {
+            status: 200,
+            body: Vec::new(),
+            stream: None,
+            headers: vec![
+                ("X-Celld-Checkpoint-Id".into(), "first".into()),
+                ("content-type".into(), "application/json".into()),
+                ("x-celld-checkpoint-id".into(), "second".into()),
+            ],
+            ws: None,
+            write_position: None,
+        };
+
+        assert_eq!(
+            take_worker_header(&mut response, CHECKPOINT_REQUEST_HEADER).as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            response.headers,
+            vec![("content-type".into(), "application/json".into())]
+        );
     }
 }

@@ -151,6 +151,28 @@ pub struct LtxRepl {
     compaction_min_txids: u64,
 }
 
+fn snapshot_active_at(
+    watch: &Path,
+    source: &Path,
+    cell: &str,
+    epoch: u64,
+) -> anyhow::Result<Option<RestoredSnapshot>> {
+    if !source.is_file() {
+        return Ok(None);
+    }
+    let directory = watch.join(format!(
+        ".inspect-{cell}-e{epoch}-{:032x}",
+        rand::random::<u128>()
+    ));
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join("db.sqlite");
+    if let Err(error) = sqlite_snapshot(source, &path) {
+        let _ = std::fs::remove_dir_all(&directory);
+        return Err(error);
+    }
+    Ok(Some(RestoredSnapshot::new(epoch, path, directory)))
+}
+
 impl LtxRepl {
     /// Private-corpus constructor over an injected store, so the epoch-seal
     /// protocol runs against an in-memory bucket instead of S3.
@@ -356,10 +378,17 @@ impl LtxRepl {
                 && celld_logic::cell::valid_cell_scope(checkpoint_id),
             "invalid checkpoint coordinate"
         );
-        let snapshot = self
-            .snapshot_active(source_cell, source_epoch)?
-            .ok_or_else(|| anyhow!("fork source is not active on this node"))?;
-        let sqlite = std::fs::read(snapshot.path())?;
+        let source = self.db_path(source_cell, source_epoch);
+        let watch = self.watch.clone();
+        let cell = source_cell.to_string();
+        let sqlite = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<u8>>> {
+            let Some(snapshot) = snapshot_active_at(&watch, &source, &cell, source_epoch)? else {
+                return Ok(None);
+            };
+            Ok(Some(std::fs::read(snapshot.path())?))
+        })
+        .await??
+        .ok_or_else(|| anyhow!("fork source is not active on this node"))?;
         let manifest = ForkSeedManifest {
             format: FORK_SEED_FORMAT.to_string(),
             checkpoint_id: checkpoint_id.to_string(),
@@ -457,7 +486,10 @@ impl LtxRepl {
         source_cell: &str,
         checkpoint_id: &str,
         target_cell: &str,
+        target_active: bool,
     ) -> anyhow::Result<ForkSeedManifest> {
+        use celld_ltx::object_store::path::Path as ObjPath;
+
         anyhow::ensure!(
             source_cell != target_cell,
             "fork source and target must differ"
@@ -470,6 +502,36 @@ impl LtxRepl {
         );
         let (manifest, sqlite) = self.read_checkpoint(source_cell, checkpoint_id).await?;
         let encoded_manifest = serde_json::to_vec(&manifest)?;
+        let ready = ObjPath::from(self.fork_seed_key(target_cell, "ready.json"));
+        let exact_retry = match self.store.get(&ready).await {
+            Ok(result) => {
+                let existing = result.bytes().await?;
+                anyhow::ensure!(
+                    existing.as_ref() == encoded_manifest,
+                    "fork seed target {target_cell} already contains a different ready.json"
+                );
+                true
+            }
+            Err(celld_ltx::object_store::Error::NotFound { .. }) => false,
+            Err(error) => return Err(anyhow!("read fork seed for {target_cell}: {error}")),
+        };
+        if exact_retry {
+            self.put_fork_seed_object(target_cell, "reserved.json", encoded_manifest.clone())
+                .await?;
+            self.put_fork_seed_object(target_cell, "database.sqlite", sqlite)
+                .await?;
+            self.put_fork_seed_object(target_cell, "ready.json", encoded_manifest)
+                .await?;
+            return Ok(manifest);
+        }
+        anyhow::ensure!(
+            !target_active,
+            "fork target {target_cell} is already active"
+        );
+        anyhow::ensure!(
+            self.highest_nonempty_epoch(target_cell).await?.is_none(),
+            "fork target {target_cell} already has a durable replica"
+        );
         self.put_fork_seed_object(target_cell, "reserved.json", encoded_manifest.clone())
             .await?;
         self.put_fork_seed_object(target_cell, "database.sqlite", sqlite)
@@ -511,27 +573,35 @@ impl LtxRepl {
             "fork seed hash mismatch"
         );
         let temporary = destination.with_extension("fork-seed.tmp");
-        let _ = std::fs::remove_file(&temporary);
-        std::fs::write(&temporary, &sqlite)?;
-        // FTS5's integrity path may use SQLite's write machinery even though
-        // quick_check is logically read-only. Validate a private temporary
-        // copy with normal flags, then prove the main database bytes remain
-        // identical to the signed manifest before activation.
-        let connection = rusqlite::Connection::open(&temporary)?;
-        let quick_check: String =
-            connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
-        anyhow::ensure!(
-            quick_check == "ok",
-            "fork seed SQLite quick_check failed: {quick_check}"
-        );
-        drop(connection);
-        let validated = std::fs::read(&temporary)?;
-        anyhow::ensure!(
-            validated.len() as u64 == manifest.sqlite_bytes
-                && format!("{:x}", Sha256::digest(&validated)) == manifest.sqlite_sha256,
-            "fork seed SQLite validation changed the database bytes"
-        );
-        std::fs::rename(temporary, destination)?;
+        let destination = destination.to_path_buf();
+        let expected_bytes = manifest.sqlite_bytes;
+        let expected_sha256 = manifest.sqlite_sha256.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let _ = std::fs::remove_file(&temporary);
+            std::fs::write(&temporary, &sqlite)?;
+            // FTS5's integrity path may use SQLite's write machinery even though
+            // quick_check is logically read-only. Validate a private temporary
+            // copy with normal flags, then prove the main database bytes remain
+            // identical to the signed manifest before activation.
+            let connection = rusqlite::Connection::open(&temporary)?;
+            let quick_check: String = connection
+                .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                .map_err(|error| anyhow!("fork seed SQLite quick_check failed: {error}"))?;
+            anyhow::ensure!(
+                quick_check == "ok",
+                "fork seed SQLite quick_check failed: {quick_check}"
+            );
+            drop(connection);
+            let validated = std::fs::read(&temporary)?;
+            anyhow::ensure!(
+                validated.len() as u64 == expected_bytes
+                    && format!("{:x}", Sha256::digest(&validated)) == expected_sha256,
+                "fork seed SQLite validation changed the database bytes"
+            );
+            std::fs::rename(temporary, destination)?;
+            Ok(())
+        })
+        .await??;
         Ok(true)
     }
 
@@ -874,16 +944,7 @@ impl LtxRepl {
         cell: &str,
         epoch: u64,
     ) -> anyhow::Result<Option<RestoredSnapshot>> {
-        let source = self.db_path(cell, epoch);
-        if !source.is_file() {
-            return Ok(None);
-        }
-        let directory = self.watch.join(format!(".inspect-{cell}-e{epoch}"));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory)?;
-        let path = directory.join("db.sqlite");
-        sqlite_snapshot(&source, &path)?;
-        Ok(Some(RestoredSnapshot::new(epoch, path, directory)))
+        snapshot_active_at(&self.watch, &self.db_path(cell, epoch), cell, epoch)
     }
 
     /// Restore the newest durable replica into a private snapshot without
@@ -1371,6 +1432,28 @@ mod fork_seed_tests {
         }
     }
 
+    async fn plant_fork_seed(
+        store: &Arc<dyn ObjectStore>,
+        cell: &str,
+        manifest: &ForkSeedManifest,
+        sqlite: Vec<u8>,
+    ) {
+        let encoded = serde_json::to_vec(manifest).unwrap();
+        for (name, bytes) in [
+            ("reserved.json", encoded.clone()),
+            ("database.sqlite", sqlite),
+            ("ready.json", encoded),
+        ] {
+            store
+                .put(
+                    &ObjPath::from(format!("cells/{cell}/fork-seed/{name}")),
+                    PutPayload::from(bytes),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn fork_seed_is_exact_create_only_and_independent() {
         let directory = tempfile::tempdir().unwrap();
@@ -1396,7 +1479,7 @@ mod fork_seed_tests {
             .await
             .unwrap();
         replication
-            .publish_fork_seed_from_checkpoint("source", "checkpoint-1", "fork")
+            .publish_fork_seed_from_checkpoint("source", "checkpoint-1", "fork", false)
             .await
             .unwrap();
         assert_eq!(manifest.source_cell, "source");
@@ -1405,7 +1488,7 @@ mod fork_seed_tests {
         assert_eq!(manifest.sqlite_sha256.len(), 64);
         assert_eq!(
             replication
-                .publish_fork_seed_from_checkpoint("source", "checkpoint-1", "fork")
+                .publish_fork_seed_from_checkpoint("source", "checkpoint-1", "fork", false,)
                 .await
                 .unwrap(),
             manifest
@@ -1426,6 +1509,25 @@ mod fork_seed_tests {
             .to_string()
             .contains("already contains a different database.sqlite"));
 
+        let existing = replication
+            .activate(activation("existing", true))
+            .await
+            .unwrap();
+        {
+            let connection = rusqlite::Connection::open(&existing.path).unwrap();
+            connection
+                .execute("CREATE TABLE occupied(value TEXT)", [])
+                .unwrap();
+        }
+        replication.await_durable("existing", 1, 1).await.unwrap();
+        let existing_target = replication
+            .publish_fork_seed_from_checkpoint("source", "checkpoint-1", "existing", false)
+            .await
+            .unwrap_err();
+        assert!(existing_target
+            .to_string()
+            .contains("already has a durable replica"));
+
         let fork = replication
             .activate(activation("fork", true))
             .await
@@ -1442,6 +1544,14 @@ mod fork_seed_tests {
             .execute("UPDATE state SET value = 'forked' WHERE key = 'phase'", [])
             .unwrap();
         drop(connection);
+        replication.await_durable("fork", 1, 1).await.unwrap();
+        assert_eq!(
+            replication
+                .publish_fork_seed_from_checkpoint("source", "checkpoint-1", "fork", true,)
+                .await
+                .unwrap(),
+            manifest
+        );
 
         let source_connection = rusqlite::Connection::open(&source.path).unwrap();
         let source_value: String = source_connection
@@ -1450,6 +1560,23 @@ mod fork_seed_tests {
             })
             .unwrap();
         assert_eq!(source_value, "source-advanced");
+    }
+
+    #[tokio::test]
+    async fn active_snapshots_use_independent_temporary_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let replication = LtxRepl::start_with_store_for_test(directory.path(), store);
+        replication
+            .activate(activation("source", true))
+            .await
+            .unwrap();
+
+        let first = replication.snapshot_active("source", 1).unwrap().unwrap();
+        let second = replication.snapshot_active("source", 1).unwrap().unwrap();
+        assert_ne!(first.path(), second.path());
+        assert!(first.path().is_file());
+        assert!(second.path().is_file());
     }
 
     #[tokio::test]
@@ -1472,6 +1599,63 @@ mod fork_seed_tests {
         assert!(!directory
             .path()
             .join("incomplete/ltx/e1/db.sqlite")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn corrupt_seed_hash_never_activates() {
+        let directory = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let sqlite = b"not a sqlite database".to_vec();
+        let manifest = ForkSeedManifest {
+            format: FORK_SEED_FORMAT.to_string(),
+            checkpoint_id: "checkpoint-corrupt-hash".to_string(),
+            source_cell: "source".to_string(),
+            source_epoch: 1,
+            sqlite_sha256: "0".repeat(64),
+            sqlite_bytes: sqlite.len() as u64,
+        };
+        plant_fork_seed(&store, "corrupt-hash", &manifest, sqlite).await;
+        let replication = LtxRepl::start_with_store_for_test(directory.path(), store);
+        let error = match replication.activate(activation("corrupt-hash", true)).await {
+            Ok(_) => panic!("corrupt hash seed activated"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("fork seed hash mismatch"));
+        assert!(!directory
+            .path()
+            .join("corrupt-hash/ltx/e1/db.sqlite")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn invalid_sqlite_seed_never_activates() {
+        let directory = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let sqlite = b"not a sqlite database".to_vec();
+        let manifest = ForkSeedManifest {
+            format: FORK_SEED_FORMAT.to_string(),
+            checkpoint_id: "checkpoint-invalid-sqlite".to_string(),
+            source_cell: "source".to_string(),
+            source_epoch: 1,
+            sqlite_sha256: format!("{:x}", Sha256::digest(&sqlite)),
+            sqlite_bytes: sqlite.len() as u64,
+        };
+        plant_fork_seed(&store, "invalid-sqlite", &manifest, sqlite).await;
+        let replication = LtxRepl::start_with_store_for_test(directory.path(), store);
+        let error = match replication
+            .activate(activation("invalid-sqlite", true))
+            .await
+        {
+            Ok(_) => panic!("invalid SQLite seed activated"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("fork seed SQLite quick_check failed"));
+        assert!(!directory
+            .path()
+            .join("invalid-sqlite/ltx/e1/db.sqlite")
             .exists());
     }
 }
