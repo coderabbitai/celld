@@ -5,6 +5,7 @@ ARG CELLD_COMMIT=unknown
 
 FROM rust:${RUST_VERSION}-bookworm AS build
 ARG TARGETARCH
+ARG CELLD_COMMIT
 # `release` for shipped artifacts; a fast-loop caller passes `lab` to skip
 # the fat-LTO relink and keep incremental state in the target cache.
 ARG CELLD_PROFILE=release
@@ -15,7 +16,7 @@ RUN --mount=type=cache,id=celld-cargo-registry,target=/usr/local/cargo/registry,
     --mount=type=cache,id=celld-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=celld-target-${TARGETARCH},target=/src/target,sharing=locked \
     mkdir -p /out && \
-    cargo build --profile "${CELLD_PROFILE}" --locked -p celld && \
+    CELLD_BUILD_COMMIT="${CELLD_COMMIT}" cargo build --profile "${CELLD_PROFILE}" --locked -p celld && \
     install -m 755 "target/${CELLD_PROFILE}/celld" /out/celld
 
 # The final image depends on this stage, so a break in the engine's tests or

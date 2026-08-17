@@ -6,8 +6,9 @@ use crate::bucket::{Bucket, CasVerdict};
 use crate::deploy;
 use crate::js::{ModuleSource, WorkerConfigOptions};
 use crate::ownership_store::NodeLeaseWire;
-use crate::protocol::{DeployPointer, Manifest, ModuleKind};
+use crate::protocol::{DeployPointer, Manifest, ModuleKind, ModuleRef};
 use anyhow::{bail, Context};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::info;
@@ -470,13 +471,38 @@ async fn load_worker_from_pointer(
 ) -> anyhow::Result<LoadedDeployment> {
     let pointer: DeployPointer = serde_json::from_str(&get_string(bucket, pointer_key).await?)
         .with_context(|| format!("decode {pointer_key}"))?;
-    let manifest: Manifest = serde_json::from_str(
-        &get_string(bucket, &format!("{}/manifest.json", pointer.prefix)).await?,
-    )
-    .context("decode deployment manifest")?;
+    let manifest_bytes = get_bytes(bucket, &format!("{}/manifest.json", pointer.prefix)).await?;
+    crate::deployment_auth::verify(
+        &pointer,
+        &manifest_bytes,
+        &crate::deployment_auth::configured_verifying_keys()?,
+    )?;
+    let manifest: Manifest =
+        serde_json::from_slice(&manifest_bytes).context("decode deployment manifest")?;
+    if manifest.version != pointer.version
+        || pointer
+            .script_name
+            .as_ref()
+            .is_some_and(|script| script != &manifest.script_name)
+        || pointer.prefix != format!("deploy/{}/{}", manifest.script_name, manifest.version)
+    {
+        bail!("deployment pointer and manifest identities are inconsistent");
+    }
     crate::protocol::validate_required_features(&manifest.required_features)?;
     let src = match manifest.main_module.as_deref() {
-        Some(main) => get_string(bucket, &format!("{}/{main}", pointer.prefix)).await?,
+        Some(main) => {
+            let reference = manifest
+                .modules
+                .iter()
+                .find(|module| module.name == main)
+                .context("deployment main module is absent from its module list")?;
+            String::from_utf8(
+                verified_module(bucket, &pointer.prefix, reference)
+                    .await?
+                    .into(),
+            )
+            .context("deployment main module is not UTF-8")?
+        }
         None if manifest.assets.is_some() => {
             // Ingress is handled by the immutable asset resolver. Keeping a
             // synthetic Worker makes the runtime construction path uniform
@@ -493,8 +519,7 @@ async fn load_worker_from_pointer(
             .iter()
             .filter(|module| manifest.main_module.as_deref() != Some(module.name.as_str()))
             .map(|module| async move {
-                let key = format!("{prefix}/{}", module.name);
-                anyhow::Ok((module, get_bytes(bucket, &key).await?))
+                anyhow::Ok((module, verified_module(bucket, prefix, module).await?))
             }),
     )
     .await?;
@@ -564,6 +589,45 @@ async fn load_worker_from_pointer(
         assets,
         services,
     })
+}
+
+async fn verified_module(
+    bucket: &Bucket,
+    prefix: &str,
+    module: &ModuleRef,
+) -> anyhow::Result<bytes::Bytes> {
+    let key = format!("{prefix}/{}", module.name);
+    let bytes = get_bytes(bucket, &key).await?;
+    validate_module_bytes(module, &bytes)?;
+    Ok(bytes)
+}
+
+fn validate_module_bytes(module: &ModuleRef, bytes: &[u8]) -> anyhow::Result<()> {
+    if module.sha256.len() != 64
+        || !module
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!(
+            "deployment module {:?} has an invalid manifest digest",
+            module.name
+        );
+    }
+    if bytes.len() != module.bytes {
+        bail!(
+            "deployment module {:?} size does not match its manifest",
+            module.name
+        );
+    }
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    if digest != module.sha256 {
+        bail!(
+            "deployment module {:?} digest does not match its manifest",
+            module.name
+        );
+    }
+    Ok(())
 }
 
 /// Apply celld's manifest-first precedence for the optional AI binding.
@@ -656,4 +720,38 @@ fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
         }
     }
     Ok(vars.into_iter().collect())
+}
+
+#[cfg(test)]
+mod deployment_module_tests {
+    use super::*;
+
+    fn reference(bytes: &[u8]) -> ModuleRef {
+        ModuleRef {
+            name: "index.js".to_string(),
+            bytes: bytes.len(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            kind: None,
+        }
+    }
+
+    #[test]
+    fn module_bytes_match_the_manifest() {
+        let module = reference(b"export default {};");
+        validate_module_bytes(&module, b"export default {};").unwrap();
+    }
+
+    #[test]
+    fn changed_or_weak_module_digests_are_rejected() {
+        let module = reference(b"export default {};");
+        assert!(validate_module_bytes(&module, b"export default { fetch() {} };").is_err());
+
+        let mut empty_digest = reference(b"export default {};");
+        empty_digest.sha256.clear();
+        assert!(validate_module_bytes(&empty_digest, b"export default {};").is_err());
+
+        let mut truncated_digest = reference(b"export default {};");
+        truncated_digest.sha256.truncate(16);
+        assert!(validate_module_bytes(&truncated_digest, b"export default {};").is_err());
+    }
 }

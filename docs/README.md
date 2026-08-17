@@ -78,22 +78,14 @@ A cell fits a workload that divides into named, stateful units:
 
 ## Install
 
-The installer downloads the `celld` binary. Replication occurs in the
-celld process. A node does not need an external replicator. If your
-project contains Worker code, `celld deploy` needs esbuild. An asset-only
-project does not need esbuild.
+Replication occurs in the celld process; a node does not need an external
+replicator. Use the release container or download an exact native binary from
+the [CodeRabbit fork releases](https://github.com/coderabbitai/celld/releases).
+Each release has a GitHub Actions build attestation. Verify a downloaded file
+with `gh attestation verify <asset> --repo coderabbitai/celld`.
 
-```sh
-curl -fsSL https://celld.dev/install.sh | sh
-```
-
-If the installer tells you, add `~/.local/bin` to `PATH`. To install one
-exact release, set `CELLD_VERSION` to the tag of that release, for example
-`v0.0.1`. To go back to a previous release, run the installer again with
-the tag of that release. The releases are on
-[GitHub](https://github.com/denoland/celld/releases). Each release has a
-GitHub Actions build attestation. To make sure that a downloaded file is
-correct, run `gh attestation verify <asset> --repo denoland/celld`.
+If your project contains Worker code, `celld deploy` needs esbuild. An
+asset-only project does not need esbuild.
 
 ## Configure object storage
 
@@ -149,7 +141,7 @@ If the project contains Worker code, install `esbuild` on `PATH`. Then run
 `celld deploy` from an applicable Wrangler project:
 
 ```sh
-git clone https://github.com/denoland/celld
+git clone https://github.com/coderabbitai/celld
 cd celld/examples/counter
 celld deploy . \
   --bucket "$CELLD_BUCKET" \
@@ -308,6 +300,7 @@ For the full list, run `celld -h`. This table shows the primary settings:
 | `CELLD_MAX_RESIDENT_CELLS` | The hard limit for resident cells, enforced at admission |
 | `CELLD_MAX_RSS_MB` | The memory threshold for pressure shedding, applied to the memory that the cells hold (default: 80% of the available memory; 0 disables the threshold and the absolute cap) |
 | `CELLD_OUTPUT_GATE` | The default is `1`, so celld proves each write durable before it acknowledges the write. Set `0` to remove the replication wait and accept possible loss of an acknowledged write |
+| `CELLD_DEPLOYMENT_VERIFY_KEYS_FILE` | JSON map of release-key IDs to base64 Ed25519 public keys. When set, every bucket deployment pointer must carry a valid signature |
 | `CELLD_LTX_COMPACTION` | The default is `1`: celld creates additive L1 objects, and a takeover reads tens of objects instead of thousands. Set `0` on every node of a mixed fleet until all nodes can read v0.5.2 block objects, because an old reader cannot take over a cell after its first L1 publication |
 | `CELLD_LTX_COMPACTION_MIN_TXIDS` | The durable TXID distance that queues an L1 attempt (default: 256) |
 | `CELLD_LTX_COMPACTIONS` | The node-wide limit for concurrent L1 attempts (default: 2) |

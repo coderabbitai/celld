@@ -8,9 +8,9 @@
 //! model is refused, never silently dropped.
 use crate::bucket::Bucket;
 use crate::protocol::{
-    asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
-    ModuleKind, ModuleRef, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_SQLITE_VEC_V1,
-    FEATURE_WASM_V1,
+    asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer,
+    DeploymentSignature, Manifest, ModuleKind, ModuleRef, Rollout, RunWorkerFirst,
+    FEATURE_ASSETS_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -53,6 +53,9 @@ pub struct Options {
     pub endpoint: Option<String>,
     pub region: Option<String>,
     pub dry_run: bool,
+    pub attestation: Option<PathBuf>,
+    pub signing_key: Option<PathBuf>,
+    pub signing_key_id: Option<String>,
 }
 
 pub fn print_help() {
@@ -61,7 +64,7 @@ pub fn print_help() {
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket; celld\n                         then rejects --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket; celld\n                         then rejects --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --attestation PATH     JSON string map of release metadata to sign\n  --signing-key PATH     File containing a base64-encoded Ed25519 seed\n  --signing-key-id ID    Verification-key ID recorded in the signature\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, or from Google\n\
 Application Default Credentials for a gs:// bucket.\n\n\
 Worker projects require `esbuild` on PATH; asset-only projects do not. Static\n\
@@ -81,12 +84,32 @@ pub fn options_from_arguments(
         endpoint: None,
         region: None,
         dry_run: false,
+        attestation: None,
+        signing_key: None,
+        signing_key_id: None,
     };
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
             "--dry-run" => options.dry_run = true,
+            "--attestation" => {
+                options.attestation = Some(PathBuf::from(
+                    arguments.next().context("--attestation requires a value")?,
+                ));
+            }
+            "--signing-key" => {
+                options.signing_key = Some(PathBuf::from(
+                    arguments.next().context("--signing-key requires a value")?,
+                ));
+            }
+            "--signing-key-id" => {
+                options.signing_key_id = Some(
+                    arguments
+                        .next()
+                        .context("--signing-key-id requires a value")?,
+                );
+            }
             "--config" => {
                 options.config = Some(PathBuf::from(
                     arguments.next().context("--config requires a value")?,
@@ -108,6 +131,16 @@ pub fn options_from_arguments(
             other if options.config.is_none() => options.config = Some(PathBuf::from(other)),
             other => bail!("`celld deploy` takes one project path, and already has one: {other}"),
         }
+    }
+    let signing_arguments = [
+        options.attestation.is_some(),
+        options.signing_key.is_some(),
+        options.signing_key_id.is_some(),
+    ];
+    if signing_arguments.iter().any(|configured| *configured)
+        && !signing_arguments.iter().all(|configured| *configured)
+    {
+        bail!("--attestation, --signing-key, and --signing-key-id must be configured together");
     }
     Ok(Some(options))
 }
@@ -151,6 +184,7 @@ pub struct Built {
     pub modules: Vec<(String, Vec<u8>)>,
     pub assets: Option<BuiltAssets>,
     pub bundled_in: Duration,
+    pub deployment_signature: Option<DeploymentSignature>,
 }
 
 impl Built {
@@ -340,7 +374,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             .map(|(name, bytes)| ModuleRef {
                 name: name.clone(),
                 bytes: bytes.len(),
-                sha256: format!("{:x}", Sha256::digest(bytes))[..16].to_string(),
+                sha256: format!("{:x}", Sha256::digest(bytes)),
                 kind: wasm_names.contains(name).then_some(ModuleKind::Wasm),
             })
             .collect(),
@@ -363,6 +397,36 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         },
         raw_metadata: project.metadata,
     };
+    let deployment_signature = match (
+        options.attestation.as_ref(),
+        options.signing_key.as_ref(),
+        options.signing_key_id.as_ref(),
+    ) {
+        (Some(attestation_path), Some(signing_key_path), Some(key_id)) => {
+            let mut metadata: BTreeMap<String, String> =
+                serde_json::from_slice(&std::fs::read(attestation_path).with_context(|| {
+                    format!("read deployment attestation {}", attestation_path.display())
+                })?)
+                .context("deployment attestation must be a JSON object of string values")?;
+            add_runtime_provenance(&mut metadata)?;
+            let unsigned_pointer = DeployPointer {
+                script_name: Some(project.script_name.clone()),
+                version: version.clone(),
+                prefix: prefix.clone(),
+                rollout: Rollout { percent: 100 },
+                signature: None,
+            };
+            Some(crate::deployment_auth::sign(
+                &unsigned_pointer,
+                &serde_json::to_vec_pretty(&manifest)?,
+                key_id.clone(),
+                metadata,
+                &crate::deployment_auth::read_signing_key(signing_key_path)?,
+            )?)
+        }
+        (None, None, None) => None,
+        _ => unreachable!("signing options are validated while parsing"),
+    };
     Ok(Built {
         script_name: project.script_name,
         version,
@@ -371,7 +435,27 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         modules,
         assets: built_assets,
         bundled_in,
+        deployment_signature,
     })
+}
+
+fn add_runtime_provenance(metadata: &mut BTreeMap<String, String>) -> anyhow::Result<()> {
+    for reserved in ["celld_version", "celld_commit"] {
+        if metadata.contains_key(reserved) {
+            bail!("deployment attestation field {reserved:?} is assigned by celld");
+        }
+    }
+    metadata.insert(
+        "celld_version".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    );
+    metadata.insert(
+        "celld_commit".to_string(),
+        option_env!("CELLD_BUILD_COMMIT")
+            .unwrap_or("unknown")
+            .to_string(),
+    );
+    Ok(())
 }
 
 pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
@@ -409,6 +493,7 @@ pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
         version: built.version.clone(),
         prefix: built.prefix.clone(),
         rollout: Rollout { percent: 100 },
+        signature: built.deployment_signature.clone(),
     };
     let encoded = serde_json::to_vec_pretty(&pointer)?;
     // The named pointer resolves service-binding components; the fleet-wide
@@ -1254,4 +1339,22 @@ fn strip_jsonc(source: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod deployment_attestation_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_provenance_is_assigned_by_the_binary() {
+        let mut metadata = BTreeMap::from([("source_commit".to_string(), "abc".to_string())]);
+        add_runtime_provenance(&mut metadata).unwrap();
+        assert_eq!(
+            metadata.get("celld_version").map(String::as_str),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert!(metadata.contains_key("celld_commit"));
+
+        assert!(add_runtime_provenance(&mut metadata).is_err());
+    }
 }

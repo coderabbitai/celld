@@ -166,6 +166,21 @@ pub struct DeployPointer {
     pub version: String,
     pub prefix: String,
     pub rollout: Rollout,
+    /// Optional operator attestation over this pointer and the exact deployment
+    /// manifest bytes. A node configured with deployment verification keys
+    /// rejects pointers without a valid signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<DeploymentSignature>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentSignature {
+    pub schema_version: u32,
+    pub key_id: String,
+    pub manifest_sha256: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+    pub ed25519: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

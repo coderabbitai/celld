@@ -29,25 +29,13 @@ truth; nodes are replaceable.
 
 ## Install
 
-The installer downloads the `celld` binary (provenance is verifiable with
-`gh attestation verify`):
-
-```sh
-curl -fsSL https://celld.dev/install.sh | sh
-```
-
-Put `~/.local/bin` on your `PATH` if the installer asks you to.
+Use the release container below, or download a native binary from the
+[CodeRabbit fork releases](https://github.com/coderabbitai/celld/releases).
+Release provenance is verifiable with
+`gh attestation verify <asset> --repo coderabbitai/celld`.
 
 Worker projects deployed with `celld deploy` need
 [esbuild](https://esbuild.github.io) on `PATH`; asset-only projects do not.
-
-The installer keeps each release under `~/.local/lib/celld/releases` and points
-one symlink at the current one. To remove celld, delete the symlink and the
-releases:
-
-```sh
-rm `which celld` && rm -rf ~/.local/lib/celld
-```
 
 ## Container
 
@@ -55,7 +43,7 @@ The release image contains the `celld` binary and is published for Linux
 x86-64 and ARM64:
 
 ```sh
-docker run --rm ghcr.io/denoland/celld --version
+docker run --rm ghcr.io/coderabbitai/celld --version
 ```
 
 Persist the runtime's local state and pass the standard AWS credential
@@ -69,7 +57,7 @@ docker run --rm --network host \
   -e AWS_SESSION_TOKEN \
   -e CELLD_WATCH=/var/lib/celld/state \
   -v celld-state:/var/lib/celld \
-  ghcr.io/denoland/celld \
+  ghcr.io/coderabbitai/celld \
   --bucket s3://my-cells-bucket \
   --endpoint https://ACCOUNT.r2.cloudflarestorage.com \
   --region auto \
