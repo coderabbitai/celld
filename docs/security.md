@@ -94,6 +94,32 @@ A person who holds the bucket credentials controls the fleet. Give each
 credential access to one fleet bucket only, and replace a credential after a
 suspected disclosure.
 
+### Require signed deployments
+
+An operator can make bucket deployment pointers fail closed by setting
+`CELLD_DEPLOYMENT_VERIFY_KEYS_FILE` on every node. The file is a JSON object
+whose keys are release-key IDs and whose values are base64-encoded 32-byte
+Ed25519 public keys. Once configured, a node rejects an unsigned pointer, an
+unknown key ID, a changed pointer, and a changed deployment manifest before it
+loads Worker code.
+
+Create a signed pointer with `celld deploy --attestation release.json
+--signing-key release.seed --signing-key-id KEY_ID`. The attestation must be a
+JSON object of string values. Celld adds its compile-time version and commit;
+the input must not assign the reserved `celld_version` or `celld_commit` keys.
+The signing-key file contains only a
+base64-encoded 32-byte Ed25519 seed; keep it out of the fleet and expose it only
+to the deployment job. Nodes need only the public-key map. Rotate by adding the
+new public key to every node, signing a deployment with the new key, and then
+removing the old key after every supported rollback deployment has been
+re-signed or retired.
+
+The signature binds the fleet pointer, rollout percentage, exact manifest
+bytes, and operator metadata. Module and asset hashes remain part of the Celld
+manifest validation path. This feature does not make a compromised Worker or a
+holder of the fleet bucket credentials harmless; it prevents bucket access
+alone from selecting unapproved Worker code when the signing key is separate.
+
 ## Keep one writer for each cell
 
 Each cell is a SQLite database with one writer. One node owns a cell at a time,

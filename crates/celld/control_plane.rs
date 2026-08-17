@@ -1817,6 +1817,12 @@ async fn apply_deployment(
     validate_managed_module_envelope(deployment)?;
     validate_managed_class_migrations(&deployment.manifest)?;
     crate::protocol::validate_required_features(&deployment.manifest.required_features)?;
+    let manifest_bytes = serde_json::to_vec_pretty(&deployment.manifest)?;
+    crate::deployment_auth::verify(
+        &deployment.pointer,
+        &manifest_bytes,
+        &crate::deployment_auth::configured_verifying_keys()?,
+    )?;
 
     let mut asset_files = 0_u32;
     let mut asset_bytes = 0_u64;
@@ -1967,7 +1973,7 @@ async fn apply_deployment(
     bucket
         .put(
             &format!("{}/manifest.json", deployment.pointer.prefix),
-            serde_json::to_vec_pretty(&deployment.manifest)?,
+            manifest_bytes,
         )
         .await?;
     bucket

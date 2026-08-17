@@ -12,6 +12,7 @@ pub mod bucket;
 pub mod control_plane;
 pub mod dead_node_gc;
 pub mod deploy;
+pub mod deployment_auth;
 pub mod env_vars;
 /// Test-only SQLite fault injection, ported from celld unchanged.
 ///
