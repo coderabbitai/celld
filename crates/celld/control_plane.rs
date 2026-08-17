@@ -2034,7 +2034,7 @@ fn validate_managed_module_envelope(deployment: &AgentDeployment) -> anyhow::Res
     let mut manifest_modules = std::collections::BTreeMap::new();
     let mut total_bytes = 0_usize;
     for module in &deployment.manifest.modules {
-        if !valid_managed_module_name(&module.name) || !valid_lower_hex(&module.sha256, 16) {
+        if !valid_managed_module_name(&module.name) || !valid_lower_hex(&module.sha256, 64) {
             return Err(anyhow!(
                 "control-plane manifest has an invalid module reference: {:?}",
                 module.name
@@ -2095,7 +2095,7 @@ fn validate_managed_module_envelope(deployment: &AgentDeployment) -> anyhow::Res
         let transport = transport_modules
             .get(name)
             .expect("module name sets compared above");
-        if !transport.sha256.starts_with(&manifest.sha256) {
+        if transport.sha256 != manifest.sha256 {
             return Err(anyhow!(
                 "control-plane transport checksum does not match manifest module {name:?}"
             ));

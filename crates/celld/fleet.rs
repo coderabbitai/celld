@@ -603,7 +603,7 @@ async fn verified_module(
 }
 
 fn validate_module_bytes(module: &ModuleRef, bytes: &[u8]) -> anyhow::Result<()> {
-    if module.sha256.len() != 16
+    if module.sha256.len() != 64
         || !module
             .sha256
             .bytes()
@@ -621,7 +621,7 @@ fn validate_module_bytes(module: &ModuleRef, bytes: &[u8]) -> anyhow::Result<()>
         );
     }
     let digest = format!("{:x}", Sha256::digest(bytes));
-    if !digest.starts_with(&module.sha256) {
+    if digest != module.sha256 {
         bail!(
             "deployment module {:?} digest does not match its manifest",
             module.name
@@ -730,7 +730,7 @@ mod deployment_module_tests {
         ModuleRef {
             name: "index.js".to_string(),
             bytes: bytes.len(),
-            sha256: format!("{:x}", Sha256::digest(bytes))[..16].to_string(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
             kind: None,
         }
     }
@@ -749,5 +749,9 @@ mod deployment_module_tests {
         let mut empty_digest = reference(b"export default {};");
         empty_digest.sha256.clear();
         assert!(validate_module_bytes(&empty_digest, b"export default {};").is_err());
+
+        let mut truncated_digest = reference(b"export default {};");
+        truncated_digest.sha256.truncate(16);
+        assert!(validate_module_bytes(&truncated_digest, b"export default {};").is_err());
     }
 }

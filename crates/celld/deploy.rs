@@ -374,7 +374,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             .map(|(name, bytes)| ModuleRef {
                 name: name.clone(),
                 bytes: bytes.len(),
-                sha256: format!("{:x}", Sha256::digest(bytes))[..16].to_string(),
+                sha256: format!("{:x}", Sha256::digest(bytes)),
                 kind: wasm_names.contains(name).then_some(ModuleKind::Wasm),
             })
             .collect(),
