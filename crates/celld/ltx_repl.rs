@@ -1115,10 +1115,19 @@ impl LtxRepl {
         )
         .await
         .context("round-trip imported LTX")?;
+        // `restored` is a private scratch copy owned by this import attempt.
+        // FTS5's integrity hook requires a writable handle while validating
+        // its inverted index, even though the check does not mutate
+        // application content. Do not include CREATE: a missing round-trip
+        // artifact must still fail closed.
         let connection = rusqlite::Connection::open_with_flags(
             &restored,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
         )?;
+        anyhow::ensure!(
+            !connection.is_readonly(rusqlite::DatabaseName::Main)?,
+            "import round-trip validation copy opened read-only"
+        );
         let integrity: String =
             connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         anyhow::ensure!(

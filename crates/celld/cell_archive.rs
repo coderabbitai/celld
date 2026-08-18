@@ -295,8 +295,23 @@ async fn export(cell: &str, output: &Path, storage: &StorageOptions) -> anyhow::
         .restore_snapshot(cell)
         .await?
         .with_context(|| format!("cell {cell} has no durable snapshot"))?;
-    crate::replication::sqlite_snapshot(snapshot.path(), output)?;
-    validate_sqlite(output)?;
+    let output_directory = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let publication = tempfile::Builder::new()
+        .prefix(".celld-export-")
+        .tempdir_in(output_directory)
+        .with_context(|| {
+            format!(
+                "create private export staging directory in {}",
+                output_directory.display()
+            )
+        })?;
+    let staged_database = publication.path().join("database.sqlite");
+    let staged_manifest = publication.path().join("database.sqlite.manifest.json");
+    crate::replication::sqlite_snapshot(snapshot.path(), &staged_database)?;
+    validate_sqlite(&staged_database)?;
     let manifest = ExportManifest {
         version: ARCHIVE_VERSION,
         cell,
@@ -304,9 +319,11 @@ async fn export(cell: &str, output: &Path, storage: &StorageOptions) -> anyhow::
         source_txid: snapshot
             .txid
             .context("durable snapshot did not report its transaction")?,
-        database_sha256: sha256_file(output)?,
+        database_sha256: sha256_file(&staged_database)?,
     };
-    write_private_new(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
+    write_private_new(&staged_manifest, &serde_json::to_vec_pretty(&manifest)?)?;
+    publish_archive_files(&staged_database, output, &staged_manifest, &manifest_path)?;
+    sync_directory(output_directory)?;
     println!(
         "exported {cell} epoch {} to {}",
         snapshot.epoch,
@@ -534,12 +551,28 @@ fn validate_sqlite(path: &Path) -> anyhow::Result<()> {
         "SQLite archive does not exist: {}",
         path.display()
     );
+    // Both callers pass a Celld-owned private snapshot: export validates the
+    // new output file and import validates its normalized copy, never the
+    // operator's source database. SQLite's FTS5 integrity hook needs a writable
+    // handle while checking the inverted index even though the check does not
+    // mutate application content. READ_ONLY therefore rejects a valid
+    // production cell with "attempt to write a readonly database". Keep CREATE
+    // absent so a missing archive still fails closed.
     let connection =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    ensure_writable_sqlite(&connection)?;
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     anyhow::ensure!(
         integrity == "ok",
         "SQLite integrity check failed: {integrity}"
+    );
+    Ok(())
+}
+
+fn ensure_writable_sqlite(connection: &rusqlite::Connection) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !connection.is_readonly(rusqlite::DatabaseName::Main)?,
+        "SQLite validation copy opened read-only"
     );
     Ok(())
 }
@@ -576,6 +609,63 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    Ok(())
+}
+
+fn publish_private_file(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    std::fs::hard_link(source, destination).with_context(|| {
+        format!(
+            "atomically publish {} without replacing an existing path",
+            destination.display()
+        )
+    })
+}
+
+fn publish_archive_files(
+    database_source: &Path,
+    database_destination: &Path,
+    manifest_source: &Path,
+    manifest_destination: &Path,
+) -> anyhow::Result<()> {
+    publish_private_file(database_source, database_destination)?;
+    if let Err(error) = publish_private_file(manifest_source, manifest_destination) {
+        if paths_reference_same_file(database_source, database_destination)? {
+            std::fs::remove_file(database_destination).with_context(|| {
+                format!(
+                    "remove partially published database {}",
+                    database_destination.display()
+                )
+            })?;
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn paths_reference_same_file(left: &Path, right: &Path) -> anyhow::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = std::fs::metadata(left)?;
+    let right = std::fs::metadata(right)?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn paths_reference_same_file(_left: &Path, _right: &Path) -> anyhow::Result<bool> {
+    // Celld release targets are Unix. On another platform, fail safely by
+    // preserving a partial database rather than deleting an unverified path.
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -659,11 +749,69 @@ mod tests {
         let path = directory.path().join("archive.sqlite");
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("CREATE TABLE values_ (value TEXT); INSERT INTO values_ VALUES ('ok');")
+            .execute_batch(
+                "CREATE TABLE values_ (value TEXT);
+                 INSERT INTO values_ VALUES ('ok');
+                 CREATE VIRTUAL TABLE knowledge_fts USING fts5(body);
+                 INSERT INTO knowledge_fts VALUES ('durable searchable knowledge');",
+            )
             .unwrap();
         drop(connection);
         validate_sqlite(&path).unwrap();
         assert_eq!(sha256_file(&path).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn rejects_a_read_only_validation_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("archive.sqlite");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("CREATE TABLE values_ (value TEXT)", [])
+            .unwrap();
+        let uri = format!("file:{}?mode=ro", path.display());
+        let connection = rusqlite::Connection::open_with_flags(
+            uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
+        assert!(ensure_writable_sqlite(&connection).is_err());
+    }
+
+    #[test]
+    fn publication_never_replaces_an_existing_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("staged");
+        let destination = directory.path().join("archive");
+        std::fs::write(&source, b"validated").unwrap();
+        std::fs::write(&destination, b"existing").unwrap();
+        assert!(publish_private_file(&source, &destination).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn manifest_collision_rolls_back_the_published_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_source = directory.path().join("staged-database");
+        let database_destination = directory.path().join("archive.sqlite");
+        let manifest_source = directory.path().join("staged-manifest");
+        let manifest_destination = directory.path().join("archive.sqlite.manifest.json");
+        std::fs::write(&database_source, b"validated database").unwrap();
+        std::fs::write(&manifest_source, b"validated manifest").unwrap();
+        std::fs::write(&manifest_destination, b"existing manifest").unwrap();
+
+        assert!(publish_archive_files(
+            &database_source,
+            &database_destination,
+            &manifest_source,
+            &manifest_destination,
+        )
+        .is_err());
+        assert!(!database_destination.exists());
+        assert_eq!(
+            std::fs::read(&manifest_destination).unwrap(),
+            b"existing manifest"
+        );
     }
 
     #[test]
