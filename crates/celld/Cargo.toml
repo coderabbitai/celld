@@ -1,6 +1,6 @@
 [package]
 name = "celld"
-version = "0.2.1-coderabbit.3"
+version = "0.2.1-coderabbit.4"
 edition = "2021"
 rust-version = "1.94.1"
 license = "Apache-2.0"
