@@ -97,6 +97,49 @@ A person who holds the bucket credentials controls the fleet. Give each
 credential access to one fleet bucket only, and replace a credential after a
 suspected disclosure.
 
+### Encrypt customer database objects
+
+Set `CELLD_DATA_ENCRYPTION_KEYRING` to a secret JSON object containing one
+active key and any retained read keys:
+
+```json
+{
+  "active_key_id": "2026-08",
+  "keys": {
+    "2026-07": "BASE64_32_BYTE_KEY",
+    "2026-08": "BASE64_32_BYTE_KEY"
+  }
+}
+```
+
+Key IDs may contain only ASCII letters, digits, periods, underscores, and
+hyphens, and may be at most 64 characters long.
+
+Celld generates a random 256-bit data key for every LTX body and SQLite
+checkpoint/fork image, encrypts the database bytes with AES-256-GCM, and wraps
+that data key with the active versioned AES-256-GCM key-encryption key. Both
+authenticated-data domains bind the envelope header and exact bucket key, so a
+copied or modified ciphertext fails restore. Ownership records, epoch seals,
+deployment pointers, and checkpoint manifests remain plaintext because they
+are coordination and integrity metadata rather than customer database bytes.
+
+Set `CELLD_DATA_ENCRYPTION_REQUIRED=1` on a fleet that carries customer data.
+Startup then fails without a valid keyring. Rotate without downtime by adding a
+new key-encryption key, making it active, and retaining every old key until no
+LTX, checkpoint, fork seed, rollback deployment, or retained object references
+it. Removing a still-referenced key makes restore fail closed.
+
+`CELLD_DATA_ENCRYPTION_ALLOW_PLAINTEXT_READS=1` is only for a reviewed migration
+of an existing plaintext fleet. New writes are still encrypted, but old objects
+may be read. New fleets must leave it disabled. The keyring itself must come
+from a secret manager or KMS-protected deployment channel; never place it in a
+Worker bundle, bucket object, command line, repository, or log.
+
+Nodes that predate this envelope format cannot read encrypted LTX. Upgrade the
+complete fleet before enabling encryption, then enable the same retained
+keyring on every node as one coordinated configuration change. Do not roll back
+to a pre-encryption binary after the first encrypted object is published.
+
 ### Require signed deployments
 
 An operator can make bucket deployment pointers fail closed by setting

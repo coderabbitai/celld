@@ -70,6 +70,10 @@ pub use client::file::FileReplicaClient;
 #[cfg(feature = "s3")]
 pub use client::object_store::ObjectStoreClient;
 
+/// Codec boundary for durable LTX bodies, behind the object-store feature.
+#[cfg(feature = "s3")]
+pub use client::object_store::{PlaintextReplicaObjectCodec, ReplicaObjectCodec};
+
 /// Configuration for the S3/R2/MinIO backend, behind the `s3` feature.
 /// Re-exported from [`crate::client::object_store::ObjectStoreConfig`].
 #[cfg(feature = "s3")]

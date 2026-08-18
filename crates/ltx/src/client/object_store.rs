@@ -46,6 +46,36 @@ use crate::TXID;
 
 use super::ReplicaClient;
 
+/// Transforms durable LTX object bytes without changing their bucket keys.
+///
+/// Hosts use this boundary for application-level encryption. Listings,
+/// ownership metadata, and epoch seals remain ordinary object-store data, while
+/// every LTX body is encoded before upload and decoded after download. The
+/// object key is part of the codec input so authenticated codecs can prevent a
+/// ciphertext from being copied into another cell or epoch.
+pub trait ReplicaObjectCodec: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn encode(&self, object_key: &str, plaintext: &[u8]) -> Result<Vec<u8>>;
+    fn decode(&self, object_key: &str, encoded: &[u8]) -> Result<Vec<u8>>;
+}
+
+#[derive(Debug, Default)]
+pub struct PlaintextReplicaObjectCodec;
+
+impl ReplicaObjectCodec for PlaintextReplicaObjectCodec {
+    fn name(&self) -> &'static str {
+        "plaintext"
+    }
+
+    fn encode(&self, _object_key: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+        Ok(plaintext.to_vec())
+    }
+
+    fn decode(&self, _object_key: &str, encoded: &[u8]) -> Result<Vec<u8>> {
+        Ok(encoded.to_vec())
+    }
+}
+
 /// The standard Litestream S3 metadata key for an LTX header timestamp.
 const METADATA_KEY_TIMESTAMP: &str = "litestream-timestamp";
 
@@ -440,6 +470,7 @@ fn match_filebase(host: &str) -> Option<String> {
 pub struct ObjectStoreClient {
     store: tokio::sync::OnceCell<Arc<dyn ObjectStore>>,
     config: ObjectStoreConfig,
+    codec: Arc<dyn ReplicaObjectCodec>,
 }
 
 impl std::fmt::Debug for ObjectStoreClient {
@@ -447,6 +478,7 @@ impl std::fmt::Debug for ObjectStoreClient {
         f.debug_struct("ObjectStoreClient")
             .field("config", &self.config)
             .field("initialized", &self.store.initialized())
+            .field("codec", &self.codec.name())
             .finish()
     }
 }
@@ -457,6 +489,7 @@ impl ObjectStoreClient {
         ObjectStoreClient {
             store: tokio::sync::OnceCell::new(),
             config,
+            codec: Arc::new(PlaintextReplicaObjectCodec),
         }
     }
 
@@ -468,6 +501,25 @@ impl ObjectStoreClient {
         ObjectStoreClient {
             store: cell,
             config,
+            codec: Arc::new(PlaintextReplicaObjectCodec),
+        }
+    }
+
+    /// Create a client over a shared store with a host-owned durable-object
+    /// codec. The codec is intentionally applied only to LTX bodies; callers
+    /// retain ordinary access to coordination metadata through the shared
+    /// store.
+    pub fn with_store_and_codec(
+        config: ObjectStoreConfig,
+        store: Arc<dyn ObjectStore>,
+        codec: Arc<dyn ReplicaObjectCodec>,
+    ) -> Self {
+        let cell = tokio::sync::OnceCell::new();
+        cell.set(store).ok();
+        ObjectStoreClient {
+            store: cell,
+            config,
+            codec,
         }
     }
 
@@ -581,7 +633,7 @@ impl ReplicaClient for ObjectStoreClient {
         };
 
         let bytes = result.bytes().await.map_err(map_os_error)?;
-        Ok(bytes.to_vec())
+        self.codec.decode(key.as_ref(), &bytes)
     }
 
     async fn write_ltx_file(
@@ -605,13 +657,15 @@ impl ReplicaClient for ObjectStoreClient {
             AttributeValue::from(format_rfc3339_nano(header.timestamp)?),
         );
         let key = ObjPath::from(self.ltx_key(level, min_txid, max_txid));
+        let encoded = self.codec.encode(key.as_ref(), data)?;
+        let encoded_size = encoded.len();
 
         // Multipart threshold: < 5 MiB → single PUT; ≥ 5 MiB → multipart with
         // fixed-size parts. Ported from the Go uploader's 5 MiB PartSize default
         // (s3/replica_client.go:99, brief §5.1).
         let part_size = self.config.effective_part_size();
-        if data.len() < MULTIPART_THRESHOLD {
-            let payload = PutPayload::from(data.to_vec());
+        if encoded.len() < MULTIPART_THRESHOLD {
+            let payload = PutPayload::from(encoded);
             let options = PutOptions {
                 attributes,
                 ..Default::default()
@@ -631,7 +685,7 @@ impl ReplicaClient for ObjectStoreClient {
                 .map_err(|e| Error::Other(format!("replica: upload to {key}: {e}").into()))?;
             // Upload in fixed-size parts (each ≥ 5 MiB except possibly the last,
             // matching object_store's part-size requirement).
-            for chunk in data.chunks(part_size.max(MULTIPART_THRESHOLD)) {
+            for chunk in encoded.chunks(part_size.max(MULTIPART_THRESHOLD)) {
                 upload
                     .put_part(PutPayload::from(chunk.to_vec()))
                     .await
@@ -648,7 +702,7 @@ impl ReplicaClient for ObjectStoreClient {
             level,
             min_txid,
             max_txid,
-            size: data.len() as i64,
+            size: encoded_size as i64,
             created_at: Some(created_at),
             ..Default::default()
         })
@@ -745,6 +799,28 @@ mod tests {
     use super::*;
     use crate::replica_url::parse_replica_url_with_query;
 
+    #[derive(Debug)]
+    struct PrefixCodec;
+
+    impl ReplicaObjectCodec for PrefixCodec {
+        fn name(&self) -> &'static str {
+            "test-prefix"
+        }
+
+        fn encode(&self, _object_key: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+            let mut encoded = b"prefix".to_vec();
+            encoded.extend_from_slice(plaintext);
+            Ok(encoded)
+        }
+
+        fn decode(&self, _object_key: &str, encoded: &[u8]) -> Result<Vec<u8>> {
+            encoded
+                .strip_prefix(b"prefix")
+                .map(|bytes| bytes.to_vec())
+                .ok_or_else(|| Error::Other("missing test prefix".into()))
+        }
+    }
+
     #[test]
     fn timestamp_metadata_matches_go_rfc3339_nano() {
         assert_eq!(
@@ -810,6 +886,47 @@ mod tests {
             .get(&Attribute::Metadata(METADATA_KEY_TIMESTAMP.into()))
             .expect("litestream timestamp metadata");
         assert_eq!(value.as_ref(), "2021-01-01T00:00:00.123Z");
+    }
+
+    #[tokio::test]
+    async fn encoded_size_matches_write_result_and_listing() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let client = ObjectStoreClient::with_store_and_codec(
+            ObjectStoreConfig {
+                bucket: "bucket".into(),
+                path: "replica".into(),
+                ..Default::default()
+            },
+            store,
+            Arc::new(PrefixCodec),
+        );
+        let data = ltx::Header {
+            version: ltx::VERSION,
+            flags: ltx::HEADER_FLAG_NO_CHECKSUM,
+            page_size: 512,
+            commit: 1,
+            min_txid: TXID(1),
+            max_txid: TXID(1),
+            timestamp: 1_609_459_200_123,
+            pre_apply_checksum: 0,
+            wal_offset: 0,
+            wal_size: 0,
+            wal_salt1: 0,
+            wal_salt2: 0,
+            node_id: 0,
+        }
+        .marshal();
+        let written = client
+            .write_ltx_file(0, TXID(1), TXID(1), &data)
+            .await
+            .unwrap();
+        let listed = client.ltx_files(0, TXID(0)).await.unwrap();
+        assert_eq!(written.size, (data.len() + 6) as i64);
+        assert_eq!(listed[0].size, written.size);
+        assert_eq!(
+            client.open_ltx_file(0, TXID(1), TXID(1)).await.unwrap(),
+            data
+        );
     }
 
     // ── ParseHost (port of TestParseHost, s3/replica_client_test.go:1071) ──────

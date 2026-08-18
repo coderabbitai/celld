@@ -36,6 +36,7 @@ use celld_ltx::Db;
 use celld_ltx::ObjectStoreClient;
 use celld_ltx::ObjectStoreConfig;
 use celld_ltx::Replica;
+use celld_ltx::ReplicaObjectCodec;
 use celld_ltx::TXID;
 use sha2::Digest;
 use sha2::Sha256;
@@ -73,6 +74,7 @@ const COMPACTION_MAX_FILES: usize = 256;
 const COMPACTION_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 
 const FORK_SEED_FORMAT: &str = "celld-sqlite-fork-seed-v1";
+const DATABASE_OBJECT_NAME: &str = "database.sqlite";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ForkSeedManifest {
@@ -142,6 +144,10 @@ pub struct LtxRepl {
     credentials: Option<StorageCredentials>,
     /// One connection pool for the whole node, shared by every cell client.
     store: Arc<dyn ObjectStore>,
+    /// Encodes only customer database bytes. Ownership, epoch seals, and other
+    /// coordination metadata deliberately bypass it so bucket CAS remains
+    /// independently operable.
+    durability_codec: Arc<dyn ReplicaObjectCodec>,
     cells: Arc<Mutex<HashMap<(String, u64), CellHandle>>>,
     /// Woken when a cell's `committed` advances, so the background loop syncs
     /// without polling; a slow tick backstops any missed notification.
@@ -180,6 +186,19 @@ impl LtxRepl {
     /// protocol runs against an in-memory bucket instead of S3.
     #[cfg(test)]
     pub fn start_with_store_for_test(watch: &Path, store: Arc<dyn ObjectStore>) -> Self {
+        Self::start_with_store_and_codec_for_test(
+            watch,
+            store,
+            Arc::new(celld_ltx::PlaintextReplicaObjectCodec),
+        )
+    }
+
+    #[cfg(test)]
+    fn start_with_store_and_codec_for_test(
+        watch: &Path,
+        store: Arc<dyn ObjectStore>,
+        durability_codec: Arc<dyn ReplicaObjectCodec>,
+    ) -> Self {
         let cells: Arc<Mutex<HashMap<(String, u64), CellHandle>>> = Arc::default();
         let dirty = Arc::new(Notify::new());
         let slots = Arc::new(Semaphore::new(SYNC_CONCURRENCY));
@@ -192,6 +211,7 @@ impl LtxRepl {
             region: "auto".into(),
             credentials: None,
             store,
+            durability_codec,
             cells,
             dirty,
             restore_slots: Arc::new(Semaphore::new(RESTORE_DOWNLOAD_CONCURRENCY)),
@@ -225,6 +245,7 @@ impl LtxRepl {
             region: "auto".into(),
             credentials: None,
             store,
+            durability_codec: Arc::new(celld_ltx::PlaintextReplicaObjectCodec),
             cells,
             dirty,
             restore_slots: Arc::new(Semaphore::new(RESTORE_DOWNLOAD_CONCURRENCY)),
@@ -243,6 +264,7 @@ impl LtxRepl {
         credentials: Option<StorageCredentials>,
     ) -> anyhow::Result<Self> {
         let compaction = compaction_config_from_env()?;
+        let durability_codec = crate::durability_encryption::codec_from_env()?;
         // Everything downstream of the store is backend-agnostic already,
         // so the dialect decides construction and nothing else.
         let store = match backend {
@@ -268,6 +290,7 @@ impl LtxRepl {
             region,
             credentials,
             store,
+            durability_codec,
             cells,
             dirty,
             restore_slots: Arc::new(Semaphore::new(RESTORE_DOWNLOAD_CONCURRENCY)),
@@ -295,7 +318,11 @@ impl LtxRepl {
             self.credentials.as_ref(),
         );
         config.path = format!("{}cells/{cell}/ltx/e{epoch}", self.prefix);
-        ObjectStoreClient::with_store(config, self.store.clone())
+        ObjectStoreClient::with_store_and_codec(
+            config,
+            self.store.clone(),
+            self.durability_codec.clone(),
+        )
     }
 
     /// Highest epoch under `cells/<cell>/ltx/` that holds any LTX — the newest
@@ -346,20 +373,34 @@ impl LtxRepl {
         use celld_ltx::object_store::{PutMode, PutOptions, PutPayload};
 
         let key = ObjPath::from(self.fork_seed_key(cell, name));
+        let stored = if name == DATABASE_OBJECT_NAME {
+            self.durability_codec
+                .encode(key.as_ref(), &bytes)
+                .map_err(|error| anyhow!("encrypt fork seed {cell}: {error}"))?
+        } else {
+            bytes.clone()
+        };
         let create = PutOptions {
             mode: PutMode::Create,
             ..Default::default()
         };
         match self
             .store
-            .put_opts(&key, PutPayload::from(bytes.clone()), create)
+            .put_opts(&key, PutPayload::from(stored), create)
             .await
         {
             Ok(_) => Ok(()),
             Err(celld_ltx::object_store::Error::AlreadyExists { .. }) => {
                 let existing = self.store.get(&key).await?.bytes().await?;
+                let existing = if name == DATABASE_OBJECT_NAME {
+                    self.durability_codec
+                        .decode(key.as_ref(), &existing)
+                        .map_err(|error| anyhow!("decrypt existing fork seed {cell}: {error}"))?
+                } else {
+                    existing.to_vec()
+                };
                 anyhow::ensure!(
-                    existing.as_ref() == bytes,
+                    existing == bytes,
                     "fork seed target {cell} already contains a different {name}"
                 );
                 Ok(())
@@ -400,7 +441,7 @@ impl LtxRepl {
             sqlite_bytes: sqlite.len() as u64,
         };
         let encoded_manifest = serde_json::to_vec(&manifest)?;
-        self.put_checkpoint_object(source_cell, checkpoint_id, "database.sqlite", sqlite)
+        self.put_checkpoint_object(source_cell, checkpoint_id, DATABASE_OBJECT_NAME, sqlite)
             .await?;
         self.put_checkpoint_object(
             source_cell,
@@ -423,20 +464,36 @@ impl LtxRepl {
         use celld_ltx::object_store::{PutMode, PutOptions, PutPayload};
 
         let key = ObjPath::from(self.checkpoint_key(cell, checkpoint, name));
+        let stored = if name == DATABASE_OBJECT_NAME {
+            self.durability_codec
+                .encode(key.as_ref(), &bytes)
+                .map_err(|error| anyhow!("encrypt checkpoint {cell}/{checkpoint}: {error}"))?
+        } else {
+            bytes.clone()
+        };
         let create = PutOptions {
             mode: PutMode::Create,
             ..Default::default()
         };
         match self
             .store
-            .put_opts(&key, PutPayload::from(bytes.clone()), create)
+            .put_opts(&key, PutPayload::from(stored), create)
             .await
         {
             Ok(_) => Ok(()),
             Err(celld_ltx::object_store::Error::AlreadyExists { .. }) => {
                 let existing = self.store.get(&key).await?.bytes().await?;
+                let existing = if name == DATABASE_OBJECT_NAME {
+                    self.durability_codec
+                        .decode(key.as_ref(), &existing)
+                        .map_err(|error| {
+                            anyhow!("decrypt existing checkpoint {cell}/{checkpoint}: {error}")
+                        })?
+                } else {
+                    existing.to_vec()
+                };
                 anyhow::ensure!(
-                    existing.as_ref() == bytes,
+                    existing == bytes,
                     "checkpoint {cell}/{checkpoint} already contains a different {name}"
                 );
                 Ok(())
@@ -467,8 +524,14 @@ impl LtxRepl {
             "checkpoint coordinates do not match its manifest"
         );
         let database_key =
-            ObjPath::from(self.checkpoint_key(source_cell, checkpoint_id, "database.sqlite"));
-        let sqlite = self.store.get(&database_key).await?.bytes().await?.to_vec();
+            ObjPath::from(self.checkpoint_key(source_cell, checkpoint_id, DATABASE_OBJECT_NAME));
+        let encoded = self.store.get(&database_key).await?.bytes().await?;
+        let sqlite = self
+            .durability_codec
+            .decode(database_key.as_ref(), &encoded)
+            .map_err(|error| {
+                anyhow!("decrypt checkpoint {source_cell}/{checkpoint_id}: {error}")
+            })?;
         anyhow::ensure!(
             sqlite.len() as u64 == manifest.sqlite_bytes,
             "checkpoint byte count mismatch"
@@ -520,7 +583,7 @@ impl LtxRepl {
         if exact_retry {
             self.put_fork_seed_object(target_cell, "reserved.json", encoded_manifest.clone())
                 .await?;
-            self.put_fork_seed_object(target_cell, "database.sqlite", sqlite)
+            self.put_fork_seed_object(target_cell, DATABASE_OBJECT_NAME, sqlite)
                 .await?;
             self.put_fork_seed_object(target_cell, "ready.json", encoded_manifest)
                 .await?;
@@ -536,7 +599,7 @@ impl LtxRepl {
         );
         self.put_fork_seed_object(target_cell, "reserved.json", encoded_manifest.clone())
             .await?;
-        self.put_fork_seed_object(target_cell, "database.sqlite", sqlite)
+        self.put_fork_seed_object(target_cell, DATABASE_OBJECT_NAME, sqlite)
             .await?;
         self.put_fork_seed_object(target_cell, "ready.json", encoded_manifest)
             .await?;
@@ -564,8 +627,12 @@ impl LtxRepl {
             manifest.format == FORK_SEED_FORMAT,
             "unsupported fork seed format"
         );
-        let database = ObjPath::from(self.fork_seed_key(cell, "database.sqlite"));
-        let sqlite = self.store.get(&database).await?.bytes().await?;
+        let database = ObjPath::from(self.fork_seed_key(cell, DATABASE_OBJECT_NAME));
+        let encoded = self.store.get(&database).await?.bytes().await?;
+        let sqlite = self
+            .durability_codec
+            .decode(database.as_ref(), &encoded)
+            .map_err(|error| anyhow!("decrypt fork seed for {cell}: {error}"))?;
         anyhow::ensure!(
             sqlite.len() as u64 == manifest.sqlite_bytes,
             "fork seed byte count mismatch"
@@ -1541,9 +1608,48 @@ fn node_config(
 #[cfg(test)]
 mod fork_seed_tests {
     use super::*;
+    use base64::Engine;
     use celld_ltx::object_store::memory::InMemory;
     use celld_ltx::object_store::path::Path as ObjPath;
     use celld_ltx::object_store::PutPayload;
+    use futures_util::TryStreamExt;
+
+    fn encrypted_codec(active: &str, keys: &[(&str, u8)]) -> Arc<dyn ReplicaObjectCodec> {
+        let keys = keys
+            .iter()
+            .map(|(id, byte)| {
+                (
+                    id.to_string(),
+                    base64::engine::general_purpose::STANDARD.encode([*byte; 32]),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        Arc::new(
+            crate::durability_encryption::Aes256GcmDurabilityCodec::parse(
+                &serde_json::json!({ "active_key_id": active, "keys": keys }).to_string(),
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    async fn raw_objects(store: &Arc<dyn ObjectStore>, prefix: &str) -> Vec<(String, Vec<u8>)> {
+        let prefix = ObjPath::from(prefix);
+        let mut listed = store.list(Some(&prefix));
+        let mut objects = Vec::new();
+        while let Some(meta) = listed.try_next().await.unwrap() {
+            let bytes = store
+                .get(&meta.location)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            objects.push((meta.location.to_string(), bytes.to_vec()));
+        }
+        objects.sort_by(|left, right| left.0.cmp(&right.0));
+        objects
+    }
 
     fn activation<'a>(cell: &'a str, fresh: bool) -> ActivationOptions<'a> {
         ActivationOptions {
@@ -1564,7 +1670,7 @@ mod fork_seed_tests {
         let encoded = serde_json::to_vec(manifest).unwrap();
         for (name, bytes) in [
             ("reserved.json", encoded.clone()),
-            ("database.sqlite", sqlite),
+            (DATABASE_OBJECT_NAME, sqlite),
             ("ready.json", encoded),
         ] {
             store
@@ -1683,6 +1789,207 @@ mod fork_seed_tests {
             })
             .unwrap();
         assert_eq!(source_value, "source-advanced");
+    }
+
+    #[tokio::test]
+    async fn encrypted_ltx_checkpoint_and_fork_survive_rotation_and_restore() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let old_directory = tempfile::tempdir().unwrap();
+        let old = LtxRepl::start_with_store_and_codec_for_test(
+            old_directory.path(),
+            store.clone(),
+            encrypted_codec("old", &[("old", 1)]),
+        );
+        let source = old.activate(activation("source", true)).await.unwrap();
+        {
+            let connection = rusqlite::Connection::open(&source.path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE state(key TEXT PRIMARY KEY, value TEXT NOT NULL);\n\
+                     INSERT INTO state VALUES ('phase', 'encrypted-old');",
+                )
+                .unwrap();
+        }
+        old.await_durable("source", 1, 1).await.unwrap();
+        old.publish_checkpoint("source", 1, "checkpoint-1")
+            .await
+            .unwrap();
+        // Create-or-verify compares decrypted bytes. A randomized nonce must
+        // not make an exact checkpoint retry look like conflicting content.
+        old.publish_checkpoint("source", 1, "checkpoint-1")
+            .await
+            .unwrap();
+
+        let old_ltx = raw_objects(&store, "cells/source/ltx/e1/").await;
+        assert!(!old_ltx.is_empty());
+        assert!(old_ltx.iter().all(|(_, bytes)| {
+            crate::durability_encryption::envelope_key_id_for_test(bytes).unwrap() == "old"
+        }));
+        let checkpoint = store
+            .get(&ObjPath::from(
+                "cells/source/checkpoints/checkpoint-1/database.sqlite",
+            ))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(checkpoint.starts_with(b"CRCELD01"));
+        assert!(!checkpoint
+            .windows(b"encrypted-old".len())
+            .any(|window| window == b"encrypted-old"));
+
+        let missing_directory = tempfile::tempdir().unwrap();
+        let missing = LtxRepl::start_with_store_and_codec_for_test(
+            missing_directory.path(),
+            store.clone(),
+            encrypted_codec("new", &[("new", 2)]),
+        );
+        let error = match missing
+            .activate(ActivationOptions {
+                cell: "source",
+                epoch: 2,
+                fresh: false,
+                took_over: true,
+                resume_local: false,
+            })
+            .await
+        {
+            Ok(_) => panic!("restore succeeded without the required old key"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unknown key old"));
+
+        let rotated_directory = tempfile::tempdir().unwrap();
+        let rotated = LtxRepl::start_with_store_and_codec_for_test(
+            rotated_directory.path(),
+            store.clone(),
+            encrypted_codec("new", &[("old", 1), ("new", 2)]),
+        );
+        let restored = rotated
+            .activate(ActivationOptions {
+                cell: "source",
+                epoch: 2,
+                fresh: false,
+                took_over: true,
+                resume_local: false,
+            })
+            .await
+            .unwrap();
+        assert!(restored.restored);
+        let connection = rusqlite::Connection::open(&restored.path).unwrap();
+        let value: String = connection
+            .query_row("SELECT value FROM state WHERE key = 'phase'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(value, "encrypted-old");
+        connection
+            .execute(
+                "UPDATE state SET value = 'encrypted-new' WHERE key = 'phase'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        rotated.await_durable("source", 2, 1).await.unwrap();
+        let new_ltx = raw_objects(&store, "cells/source/ltx/e2/").await;
+        assert!(!new_ltx.is_empty());
+        assert!(new_ltx.iter().all(|(_, bytes)| {
+            crate::durability_encryption::envelope_key_id_for_test(bytes).unwrap() == "new"
+        }));
+
+        rotated
+            .publish_fork_seed_from_checkpoint("source", "checkpoint-1", "fork", false)
+            .await
+            .unwrap();
+        rotated
+            .publish_fork_seed_from_checkpoint("source", "checkpoint-1", "fork", false)
+            .await
+            .unwrap();
+        let fork_object = store
+            .get(&ObjPath::from("cells/fork/fork-seed/database.sqlite"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(fork_object.starts_with(b"CRCELD01"));
+        assert_eq!(
+            crate::durability_encryption::envelope_key_id_for_test(&fork_object).unwrap(),
+            "new"
+        );
+
+        let fork = rotated.activate(activation("fork", true)).await.unwrap();
+        assert!(fork.restored);
+        let fork_connection = rusqlite::Connection::open(&fork.path).unwrap();
+        let fork_value: String = fork_connection
+            .query_row("SELECT value FROM state WHERE key = 'phase'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fork_value, "encrypted-old");
+
+        // The supported offline export path restores through the same codec.
+        let exported = rotated.restore_snapshot("source").await.unwrap().unwrap();
+        let exported_connection = rusqlite::Connection::open(exported.path()).unwrap();
+        let exported_value: String = exported_connection
+            .query_row("SELECT value FROM state WHERE key = 'phase'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(exported_value, "encrypted-new");
+
+        // The supported offline import path encrypts its new LTX lineage and
+        // verifies it by immediately restoring through the configured codec.
+        let import_directory = tempfile::tempdir().unwrap();
+        let import_database = import_directory.path().join("import.sqlite");
+        let import_connection = rusqlite::Connection::open(&import_database).unwrap();
+        import_connection
+            .execute_batch(
+                "CREATE TABLE imported(value TEXT NOT NULL);\n\
+                 INSERT INTO imported VALUES ('encrypted-import');",
+            )
+            .unwrap();
+        drop(import_connection);
+        rotated
+            .seed_import_epoch("imported", 1, &import_database)
+            .await
+            .unwrap();
+        let imported_ltx = raw_objects(&store, "cells/imported/ltx/e1/").await;
+        assert!(!imported_ltx.is_empty());
+        assert!(imported_ltx.iter().all(|(_, bytes)| {
+            crate::durability_encryption::envelope_key_id_for_test(bytes).unwrap() == "new"
+        }));
+
+        let (tampered_key, mut tampered_bytes) = new_ltx.into_iter().next().unwrap();
+        *tampered_bytes.last_mut().unwrap() ^= 1;
+        store
+            .put(
+                &ObjPath::from(tampered_key),
+                PutPayload::from(tampered_bytes),
+            )
+            .await
+            .unwrap();
+        let corrupt_directory = tempfile::tempdir().unwrap();
+        let corrupt = LtxRepl::start_with_store_and_codec_for_test(
+            corrupt_directory.path(),
+            store.clone(),
+            encrypted_codec("new", &[("old", 1), ("new", 2)]),
+        );
+        let error = match corrupt
+            .activate(ActivationOptions {
+                cell: "source",
+                epoch: 3,
+                fresh: false,
+                took_over: true,
+                resume_local: false,
+            })
+            .await
+        {
+            Ok(_) => panic!("restore accepted tampered ciphertext"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("authentication failed"));
     }
 
     #[tokio::test]
