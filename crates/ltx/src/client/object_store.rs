@@ -46,6 +46,36 @@ use crate::TXID;
 
 use super::ReplicaClient;
 
+/// Transforms durable LTX object bytes without changing their bucket keys.
+///
+/// Hosts use this boundary for application-level encryption. Listings,
+/// ownership metadata, and epoch seals remain ordinary object-store data, while
+/// every LTX body is encoded before upload and decoded after download. The
+/// object key is part of the codec input so authenticated codecs can prevent a
+/// ciphertext from being copied into another cell or epoch.
+pub trait ReplicaObjectCodec: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn encode(&self, object_key: &str, plaintext: &[u8]) -> Result<Vec<u8>>;
+    fn decode(&self, object_key: &str, encoded: &[u8]) -> Result<Vec<u8>>;
+}
+
+#[derive(Debug, Default)]
+pub struct PlaintextReplicaObjectCodec;
+
+impl ReplicaObjectCodec for PlaintextReplicaObjectCodec {
+    fn name(&self) -> &'static str {
+        "plaintext"
+    }
+
+    fn encode(&self, _object_key: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+        Ok(plaintext.to_vec())
+    }
+
+    fn decode(&self, _object_key: &str, encoded: &[u8]) -> Result<Vec<u8>> {
+        Ok(encoded.to_vec())
+    }
+}
+
 /// The standard Litestream S3 metadata key for an LTX header timestamp.
 const METADATA_KEY_TIMESTAMP: &str = "litestream-timestamp";
 
@@ -440,6 +470,7 @@ fn match_filebase(host: &str) -> Option<String> {
 pub struct ObjectStoreClient {
     store: tokio::sync::OnceCell<Arc<dyn ObjectStore>>,
     config: ObjectStoreConfig,
+    codec: Arc<dyn ReplicaObjectCodec>,
 }
 
 impl std::fmt::Debug for ObjectStoreClient {
@@ -447,6 +478,7 @@ impl std::fmt::Debug for ObjectStoreClient {
         f.debug_struct("ObjectStoreClient")
             .field("config", &self.config)
             .field("initialized", &self.store.initialized())
+            .field("codec", &self.codec.name())
             .finish()
     }
 }
@@ -457,6 +489,7 @@ impl ObjectStoreClient {
         ObjectStoreClient {
             store: tokio::sync::OnceCell::new(),
             config,
+            codec: Arc::new(PlaintextReplicaObjectCodec),
         }
     }
 
@@ -468,6 +501,25 @@ impl ObjectStoreClient {
         ObjectStoreClient {
             store: cell,
             config,
+            codec: Arc::new(PlaintextReplicaObjectCodec),
+        }
+    }
+
+    /// Create a client over a shared store with a host-owned durable-object
+    /// codec. The codec is intentionally applied only to LTX bodies; callers
+    /// retain ordinary access to coordination metadata through the shared
+    /// store.
+    pub fn with_store_and_codec(
+        config: ObjectStoreConfig,
+        store: Arc<dyn ObjectStore>,
+        codec: Arc<dyn ReplicaObjectCodec>,
+    ) -> Self {
+        let cell = tokio::sync::OnceCell::new();
+        cell.set(store).ok();
+        ObjectStoreClient {
+            store: cell,
+            config,
+            codec,
         }
     }
 
@@ -581,7 +633,7 @@ impl ReplicaClient for ObjectStoreClient {
         };
 
         let bytes = result.bytes().await.map_err(map_os_error)?;
-        Ok(bytes.to_vec())
+        self.codec.decode(key.as_ref(), &bytes)
     }
 
     async fn write_ltx_file(
@@ -605,13 +657,14 @@ impl ReplicaClient for ObjectStoreClient {
             AttributeValue::from(format_rfc3339_nano(header.timestamp)?),
         );
         let key = ObjPath::from(self.ltx_key(level, min_txid, max_txid));
+        let encoded = self.codec.encode(key.as_ref(), data)?;
 
         // Multipart threshold: < 5 MiB → single PUT; ≥ 5 MiB → multipart with
         // fixed-size parts. Ported from the Go uploader's 5 MiB PartSize default
         // (s3/replica_client.go:99, brief §5.1).
         let part_size = self.config.effective_part_size();
-        if data.len() < MULTIPART_THRESHOLD {
-            let payload = PutPayload::from(data.to_vec());
+        if encoded.len() < MULTIPART_THRESHOLD {
+            let payload = PutPayload::from(encoded);
             let options = PutOptions {
                 attributes,
                 ..Default::default()
@@ -631,7 +684,7 @@ impl ReplicaClient for ObjectStoreClient {
                 .map_err(|e| Error::Other(format!("replica: upload to {key}: {e}").into()))?;
             // Upload in fixed-size parts (each ≥ 5 MiB except possibly the last,
             // matching object_store's part-size requirement).
-            for chunk in data.chunks(part_size.max(MULTIPART_THRESHOLD)) {
+            for chunk in encoded.chunks(part_size.max(MULTIPART_THRESHOLD)) {
                 upload
                     .put_part(PutPayload::from(chunk.to_vec()))
                     .await

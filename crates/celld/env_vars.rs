@@ -17,6 +17,8 @@ pub fn validate() -> anyhow::Result<()> {
     for name in [
         "CELLD_CLOUD",
         "CELLD_CLOUD_RESTART_ON_DEPLOY",
+        "CELLD_DATA_ENCRYPTION_ALLOW_PLAINTEXT_READS",
+        "CELLD_DATA_ENCRYPTION_REQUIRED",
         "CELLD_LTX_COMPACTION",
         "CELLD_OUTPUT_GATE",
         "CELLD_PRESENCE_SHADOW",

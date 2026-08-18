@@ -22,6 +22,13 @@ readonly ACCESS_KEY
 SECRET_KEY="$(printf '%s' "$RUN_ID-secret" | shasum -a 256 | cut -c1-32)"
 readonly SECRET_KEY
 export TEST_ROOT
+# Test-only key material: exercise the production image's required encrypted
+# import/export path against the real object-store API. Docker receives only
+# the environment variable name, matching secret-injected deployments.
+TEST_KEY="$(printf '00000000000000000000000000000000' | base64 | tr -d '\n')"
+readonly TEST_KEY
+export CELLD_DATA_ENCRYPTION_KEYRING="{\"active_key_id\":\"archive-test\",\"keys\":{\"archive-test\":\"$TEST_KEY\"}}"
+export CELLD_DATA_ENCRYPTION_REQUIRED=1
 
 if [[ "$BACKEND" != 'minio' && "$BACKEND" != 'gcs' ]]; then
 	echo 'CELLD_ARCHIVE_BACKEND must be minio or gcs' >&2
@@ -165,7 +172,8 @@ celld() {
 		docker run --rm --network "$NETWORK" --user "$(id -u):$(id -g)" \
 			-v "$TEST_ROOT:/archive" \
 			-e "AWS_ACCESS_KEY_ID=$ACCESS_KEY" -e "AWS_SECRET_ACCESS_KEY=$SECRET_KEY" \
-			-e AWS_REGION=us-east-1 "$CELLD_IMAGE" "$@"
+			-e AWS_REGION=us-east-1 -e CELLD_DATA_ENCRYPTION_KEYRING \
+			-e CELLD_DATA_ENCRYPTION_REQUIRED "$CELLD_IMAGE" "$@"
 	else
 		"$CELLD_ARCHIVE_BINARY" "$@"
 	fi
@@ -181,6 +189,7 @@ fi
 
 celld cell import Knowledge:test --input "$archive_root/source.sqlite" \
 	"${storage_args[@]}" --offline
+test "$(object_cat 'cells/Knowledge:test/ltx/e1/0000/0000000000000001-0000000000000001.ltx' | head -c 8)" = 'CRCELD01'
 celld cell export Knowledge:test --output "$archive_root/export.sqlite" \
 	"${storage_args[@]}"
 

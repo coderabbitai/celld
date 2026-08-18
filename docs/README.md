@@ -336,6 +336,9 @@ For the full list, run `celld -h`. This table shows the primary settings:
 | `CELLD_MAX_RESIDENT_CELLS` | The hard limit for resident cells, enforced at admission |
 | `CELLD_MAX_RSS_MB` | The memory threshold for pressure shedding, applied to the memory that the cells hold (default: 80% of the available memory; 0 disables the threshold and the absolute cap) |
 | `CELLD_OUTPUT_GATE` | The default is `1`, so celld proves each write durable before it acknowledges the write. Set `0` to remove the replication wait and accept possible loss of an acknowledged write |
+| `CELLD_DATA_ENCRYPTION_KEYRING` | Secret JSON containing `active_key_id` and a map of versioned key IDs to base64 32-byte AES key-encryption keys. When set, each LTX body and SQLite checkpoint/fork image gets a random data key wrapped by the active key-encryption key; both AES-256-GCM layers are authenticated to the exact object key |
+| `CELLD_DATA_ENCRYPTION_REQUIRED` | Set to `1` on fleets that must never write plaintext customer database bytes. Startup fails unless a valid keyring is present |
+| `CELLD_DATA_ENCRYPTION_ALLOW_PLAINTEXT_READS` | Temporary migration-only switch. Set to `1` with a keyring to read legacy plaintext LTX while all new durable objects are encrypted. Do not enable it on a new fleet |
 | `CELLD_DEPLOYMENT_VERIFY_KEYS_FILE` | JSON map of release-key IDs to base64 Ed25519 public keys. When set, every bucket deployment pointer must carry a valid signature |
 | `CELLD_LTX_COMPACTION` | The default is `1`: celld creates additive L1 objects, and a takeover reads tens of objects instead of thousands. Set `0` on every node of a mixed fleet until all nodes can read v0.5.2 block objects, because an old reader cannot take over a cell after its first L1 publication |
 | `CELLD_LTX_COMPACTION_MIN_TXIDS` | The durable TXID distance that queues an L1 attempt (default: 256) |
