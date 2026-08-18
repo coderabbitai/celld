@@ -74,6 +74,7 @@ const COMPACTION_MAX_FILES: usize = 256;
 const COMPACTION_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 
 const FORK_SEED_FORMAT: &str = "celld-sqlite-fork-seed-v1";
+const DATABASE_OBJECT_NAME: &str = "database.sqlite";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ForkSeedManifest {
@@ -372,7 +373,7 @@ impl LtxRepl {
         use celld_ltx::object_store::{PutMode, PutOptions, PutPayload};
 
         let key = ObjPath::from(self.fork_seed_key(cell, name));
-        let stored = if name == "database.sqlite" {
+        let stored = if name == DATABASE_OBJECT_NAME {
             self.durability_codec
                 .encode(key.as_ref(), &bytes)
                 .map_err(|error| anyhow!("encrypt fork seed {cell}: {error}"))?
@@ -391,7 +392,7 @@ impl LtxRepl {
             Ok(_) => Ok(()),
             Err(celld_ltx::object_store::Error::AlreadyExists { .. }) => {
                 let existing = self.store.get(&key).await?.bytes().await?;
-                let existing = if name == "database.sqlite" {
+                let existing = if name == DATABASE_OBJECT_NAME {
                     self.durability_codec
                         .decode(key.as_ref(), &existing)
                         .map_err(|error| anyhow!("decrypt existing fork seed {cell}: {error}"))?
@@ -440,7 +441,7 @@ impl LtxRepl {
             sqlite_bytes: sqlite.len() as u64,
         };
         let encoded_manifest = serde_json::to_vec(&manifest)?;
-        self.put_checkpoint_object(source_cell, checkpoint_id, "database.sqlite", sqlite)
+        self.put_checkpoint_object(source_cell, checkpoint_id, DATABASE_OBJECT_NAME, sqlite)
             .await?;
         self.put_checkpoint_object(
             source_cell,
@@ -463,7 +464,7 @@ impl LtxRepl {
         use celld_ltx::object_store::{PutMode, PutOptions, PutPayload};
 
         let key = ObjPath::from(self.checkpoint_key(cell, checkpoint, name));
-        let stored = if name == "database.sqlite" {
+        let stored = if name == DATABASE_OBJECT_NAME {
             self.durability_codec
                 .encode(key.as_ref(), &bytes)
                 .map_err(|error| anyhow!("encrypt checkpoint {cell}/{checkpoint}: {error}"))?
@@ -482,7 +483,7 @@ impl LtxRepl {
             Ok(_) => Ok(()),
             Err(celld_ltx::object_store::Error::AlreadyExists { .. }) => {
                 let existing = self.store.get(&key).await?.bytes().await?;
-                let existing = if name == "database.sqlite" {
+                let existing = if name == DATABASE_OBJECT_NAME {
                     self.durability_codec
                         .decode(key.as_ref(), &existing)
                         .map_err(|error| {
@@ -523,7 +524,7 @@ impl LtxRepl {
             "checkpoint coordinates do not match its manifest"
         );
         let database_key =
-            ObjPath::from(self.checkpoint_key(source_cell, checkpoint_id, "database.sqlite"));
+            ObjPath::from(self.checkpoint_key(source_cell, checkpoint_id, DATABASE_OBJECT_NAME));
         let encoded = self.store.get(&database_key).await?.bytes().await?;
         let sqlite = self
             .durability_codec
@@ -582,7 +583,7 @@ impl LtxRepl {
         if exact_retry {
             self.put_fork_seed_object(target_cell, "reserved.json", encoded_manifest.clone())
                 .await?;
-            self.put_fork_seed_object(target_cell, "database.sqlite", sqlite)
+            self.put_fork_seed_object(target_cell, DATABASE_OBJECT_NAME, sqlite)
                 .await?;
             self.put_fork_seed_object(target_cell, "ready.json", encoded_manifest)
                 .await?;
@@ -598,7 +599,7 @@ impl LtxRepl {
         );
         self.put_fork_seed_object(target_cell, "reserved.json", encoded_manifest.clone())
             .await?;
-        self.put_fork_seed_object(target_cell, "database.sqlite", sqlite)
+        self.put_fork_seed_object(target_cell, DATABASE_OBJECT_NAME, sqlite)
             .await?;
         self.put_fork_seed_object(target_cell, "ready.json", encoded_manifest)
             .await?;
@@ -626,7 +627,7 @@ impl LtxRepl {
             manifest.format == FORK_SEED_FORMAT,
             "unsupported fork seed format"
         );
-        let database = ObjPath::from(self.fork_seed_key(cell, "database.sqlite"));
+        let database = ObjPath::from(self.fork_seed_key(cell, DATABASE_OBJECT_NAME));
         let encoded = self.store.get(&database).await?.bytes().await?;
         let sqlite = self
             .durability_codec
@@ -1669,7 +1670,7 @@ mod fork_seed_tests {
         let encoded = serde_json::to_vec(manifest).unwrap();
         for (name, bytes) in [
             ("reserved.json", encoded.clone()),
-            ("database.sqlite", sqlite),
+            (DATABASE_OBJECT_NAME, sqlite),
             ("ready.json", encoded),
         ] {
             store
@@ -1821,9 +1822,9 @@ mod fork_seed_tests {
 
         let old_ltx = raw_objects(&store, "cells/source/ltx/e1/").await;
         assert!(!old_ltx.is_empty());
-        assert!(old_ltx
-            .iter()
-            .all(|(_, bytes)| { bytes.starts_with(b"CRCELD01") && &bytes[44..47] == b"old" }));
+        assert!(old_ltx.iter().all(|(_, bytes)| {
+            crate::durability_encryption::envelope_key_id_for_test(bytes).unwrap() == "old"
+        }));
         let checkpoint = store
             .get(&ObjPath::from(
                 "cells/source/checkpoints/checkpoint-1/database.sqlite",
@@ -1893,9 +1894,9 @@ mod fork_seed_tests {
         rotated.await_durable("source", 2, 1).await.unwrap();
         let new_ltx = raw_objects(&store, "cells/source/ltx/e2/").await;
         assert!(!new_ltx.is_empty());
-        assert!(new_ltx
-            .iter()
-            .all(|(_, bytes)| { bytes.starts_with(b"CRCELD01") && &bytes[44..47] == b"new" }));
+        assert!(new_ltx.iter().all(|(_, bytes)| {
+            crate::durability_encryption::envelope_key_id_for_test(bytes).unwrap() == "new"
+        }));
 
         rotated
             .publish_fork_seed_from_checkpoint("source", "checkpoint-1", "fork", false)
@@ -1913,7 +1914,10 @@ mod fork_seed_tests {
             .await
             .unwrap();
         assert!(fork_object.starts_with(b"CRCELD01"));
-        assert_eq!(&fork_object[44..47], b"new");
+        assert_eq!(
+            crate::durability_encryption::envelope_key_id_for_test(&fork_object).unwrap(),
+            "new"
+        );
 
         let fork = rotated.activate(activation("fork", true)).await.unwrap();
         assert!(fork.restored);
@@ -1953,9 +1957,9 @@ mod fork_seed_tests {
             .unwrap();
         let imported_ltx = raw_objects(&store, "cells/imported/ltx/e1/").await;
         assert!(!imported_ltx.is_empty());
-        assert!(imported_ltx
-            .iter()
-            .all(|(_, bytes)| { bytes.starts_with(b"CRCELD01") && &bytes[44..47] == b"new" }));
+        assert!(imported_ltx.iter().all(|(_, bytes)| {
+            crate::durability_encryption::envelope_key_id_for_test(bytes).unwrap() == "new"
+        }));
 
         let (tampered_key, mut tampered_bytes) = new_ltx.into_iter().next().unwrap();
         *tampered_bytes.last_mut().unwrap() ^= 1;

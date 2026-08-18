@@ -658,6 +658,7 @@ impl ReplicaClient for ObjectStoreClient {
         );
         let key = ObjPath::from(self.ltx_key(level, min_txid, max_txid));
         let encoded = self.codec.encode(key.as_ref(), data)?;
+        let encoded_size = encoded.len();
 
         // Multipart threshold: < 5 MiB → single PUT; ≥ 5 MiB → multipart with
         // fixed-size parts. Ported from the Go uploader's 5 MiB PartSize default
@@ -701,7 +702,7 @@ impl ReplicaClient for ObjectStoreClient {
             level,
             min_txid,
             max_txid,
-            size: data.len() as i64,
+            size: encoded_size as i64,
             created_at: Some(created_at),
             ..Default::default()
         })
@@ -798,6 +799,28 @@ mod tests {
     use super::*;
     use crate::replica_url::parse_replica_url_with_query;
 
+    #[derive(Debug)]
+    struct PrefixCodec;
+
+    impl ReplicaObjectCodec for PrefixCodec {
+        fn name(&self) -> &'static str {
+            "test-prefix"
+        }
+
+        fn encode(&self, _object_key: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+            let mut encoded = b"prefix".to_vec();
+            encoded.extend_from_slice(plaintext);
+            Ok(encoded)
+        }
+
+        fn decode(&self, _object_key: &str, encoded: &[u8]) -> Result<Vec<u8>> {
+            encoded
+                .strip_prefix(b"prefix")
+                .map(|bytes| bytes.to_vec())
+                .ok_or_else(|| Error::Other("missing test prefix".into()))
+        }
+    }
+
     #[test]
     fn timestamp_metadata_matches_go_rfc3339_nano() {
         assert_eq!(
@@ -863,6 +886,47 @@ mod tests {
             .get(&Attribute::Metadata(METADATA_KEY_TIMESTAMP.into()))
             .expect("litestream timestamp metadata");
         assert_eq!(value.as_ref(), "2021-01-01T00:00:00.123Z");
+    }
+
+    #[tokio::test]
+    async fn encoded_size_matches_write_result_and_listing() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let client = ObjectStoreClient::with_store_and_codec(
+            ObjectStoreConfig {
+                bucket: "bucket".into(),
+                path: "replica".into(),
+                ..Default::default()
+            },
+            store,
+            Arc::new(PrefixCodec),
+        );
+        let data = ltx::Header {
+            version: ltx::VERSION,
+            flags: ltx::HEADER_FLAG_NO_CHECKSUM,
+            page_size: 512,
+            commit: 1,
+            min_txid: TXID(1),
+            max_txid: TXID(1),
+            timestamp: 1_609_459_200_123,
+            pre_apply_checksum: 0,
+            wal_offset: 0,
+            wal_size: 0,
+            wal_salt1: 0,
+            wal_salt2: 0,
+            node_id: 0,
+        }
+        .marshal();
+        let written = client
+            .write_ltx_file(0, TXID(1), TXID(1), &data)
+            .await
+            .unwrap();
+        let listed = client.ltx_files(0, TXID(0)).await.unwrap();
+        assert_eq!(written.size, (data.len() + 6) as i64);
+        assert_eq!(listed[0].size, written.size);
+        assert_eq!(
+            client.open_ltx_file(0, TXID(1), TXID(1)).await.unwrap(),
+            data
+        );
     }
 
     // ── ParseHost (port of TestParseHost, s3/replica_client_test.go:1071) ──────

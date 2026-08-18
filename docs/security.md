@@ -112,6 +112,9 @@ active key and any retained read keys:
 }
 ```
 
+Key IDs may contain only ASCII letters, digits, periods, underscores, and
+hyphens, and may be at most 64 characters long.
+
 Celld generates a random 256-bit data key for every LTX body and SQLite
 checkpoint/fork image, encrypts the database bytes with AES-256-GCM, and wraps
 that data key with the active versioned AES-256-GCM key-encryption key. Both

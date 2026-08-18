@@ -265,6 +265,22 @@ impl ReplicaObjectCodec for Aes256GcmDurabilityCodec {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn envelope_key_id_for_test(encoded: &[u8]) -> anyhow::Result<&str> {
+    anyhow::ensure!(
+        encoded.starts_with(MAGIC) && encoded.len() >= FIXED_HEADER_BYTES,
+        "not a complete encrypted durability header"
+    );
+    let key_id_length = u16::from_be_bytes([encoded[8], encoded[9]]) as usize;
+    let end = FIXED_HEADER_BYTES
+        .checked_add(key_id_length)
+        .context("encrypted durability key ID length overflow")?;
+    let key_id = encoded
+        .get(FIXED_HEADER_BYTES..end)
+        .context("encrypted durability key ID is truncated")?;
+    std::str::from_utf8(key_id).context("encrypted durability key ID is invalid UTF-8")
+}
+
 pub fn codec_from_env() -> anyhow::Result<Arc<dyn ReplicaObjectCodec>> {
     let required = crate::env_vars::flag("CELLD_DATA_ENCRYPTION_REQUIRED", false)?;
     let allow_plaintext_reads =
@@ -320,6 +336,8 @@ mod tests {
         let encoded = codec
             .encode("cells/a/ltx/e1/0000/x.ltx", plaintext)
             .unwrap();
+        assert_eq!(envelope_key_id_for_test(&encoded).unwrap(), "v2");
+        assert!(envelope_key_id_for_test(b"CRCELD01").is_err());
         assert!(!encoded
             .windows(plaintext.len())
             .any(|bytes| bytes == plaintext));
