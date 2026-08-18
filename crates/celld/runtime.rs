@@ -209,6 +209,25 @@ impl CellInitializationReservation {
             cell: cell.to_string(),
         })
     }
+
+    fn acquire_if_inactive(
+        cells: &Arc<Mutex<CellRegistry>>,
+        cell: &str,
+    ) -> anyhow::Result<Option<Self>> {
+        let mut registry = cells.lock().expect("cell registry poisoned");
+        if registry.starting.contains_key(cell)
+            || registry.published.contains_key(cell)
+            || registry.initializing.contains(cell)
+        {
+            return Ok(None);
+        }
+        registry.reserve_initialization(cell)?;
+        drop(registry);
+        Ok(Some(Self {
+            cells: cells.clone(),
+            cell: cell.to_string(),
+        }))
+    }
 }
 
 impl Drop for CellInitializationReservation {
@@ -469,11 +488,22 @@ impl RuntimeManager {
         checkpoint_id: &str,
         target_cell: &str,
     ) -> anyhow::Result<crate::ltx_repl::ForkSeedManifest> {
-        let _target_reservation = CellInitializationReservation::acquire(&self.cells, target_cell)?;
+        // A retry after activation must verify the immutable seed and succeed;
+        // reserving first used to reject that exact retry merely because the
+        // target runtime now existed. A never-seen target remains reserved across
+        // publication so activation cannot race the final ready manifest.
+        let target_reservation =
+            CellInitializationReservation::acquire_if_inactive(&self.cells, target_cell)?;
+        let target_active = target_reservation.is_none();
         self.replication
             .as_ref()
             .ok_or_else(|| anyhow!("forking requires durable replication"))?
-            .publish_fork_seed_from_checkpoint(source_cell, checkpoint_id, target_cell, false)
+            .publish_fork_seed_from_checkpoint(
+                source_cell,
+                checkpoint_id,
+                target_cell,
+                target_active,
+            )
             .await
     }
 
@@ -2098,5 +2128,24 @@ mod tests {
 
         CellInitializationReservation::acquire(&cells, "Class:target")
             .expect("reservation is released after publication");
+    }
+
+    #[test]
+    fn retry_reservation_distinguishes_an_existing_target() {
+        let cells = Arc::new(Mutex::new(CellRegistry::default()));
+        let first = CellInitializationReservation::acquire_if_inactive(&cells, "Class:target")
+            .expect("reserve unused target")
+            .expect("unused target is reserved");
+        assert!(
+            CellInitializationReservation::acquire_if_inactive(&cells, "Class:target")
+                .expect("recognize existing target")
+                .is_none()
+        );
+        drop(first);
+        assert!(
+            CellInitializationReservation::acquire_if_inactive(&cells, "Class:target")
+                .expect("reserve released target")
+                .is_some()
+        );
     }
 }
