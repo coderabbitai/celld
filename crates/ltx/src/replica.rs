@@ -404,6 +404,8 @@ pub async fn restore<C: ReplicaClient>(
 pub struct RestorePlanStats {
     pub objects: usize,
     pub bytes: u64,
+    /// Highest transaction included in the fixed restore plan.
+    pub max_txid: u64,
     /// Object count per compaction level, ordered by level.
     pub by_level: BTreeMap<i32, usize>,
 }
@@ -458,6 +460,7 @@ pub async fn restore_with_download_slots<C: ReplicaClient>(
     let mut stats = RestorePlanStats {
         objects: infos.len(),
         bytes: infos.iter().map(|info| info.size.max(0) as u64).sum(),
+        max_txid: slice_max_txid(&infos).0,
         by_level: BTreeMap::new(),
     };
     for info in &infos {

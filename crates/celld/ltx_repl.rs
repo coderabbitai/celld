@@ -15,6 +15,7 @@
 //! one bucket would replicate over each other.
 
 use std::collections::HashMap;
+use std::io::{BufReader, Read};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -27,6 +28,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::anyhow;
+use anyhow::Context;
 use celld_ltx::object_store::ObjectStore;
 use celld_ltx::replica;
 use celld_ltx::replica_compactor::ReplicaCompactor;
@@ -170,7 +172,7 @@ fn snapshot_active_at(
         let _ = std::fs::remove_dir_all(&directory);
         return Err(error);
     }
-    Ok(Some(RestoredSnapshot::new(epoch, path, directory)))
+    Ok(Some(RestoredSnapshot::new(epoch, None, path, directory)))
 }
 
 impl LtxRepl {
@@ -957,7 +959,7 @@ impl LtxRepl {
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory)?;
         let path = directory.join("db.sqlite");
-        replica::restore_with_download_slots(
+        let stats = replica::restore_with_download_slots(
             &self.client_for(cell, epoch),
             &path,
             TXID(0),
@@ -965,7 +967,108 @@ impl LtxRepl {
         )
         .await
         .map_err(|error| anyhow!("restore snapshot {cell} e{epoch}: {error}"))?;
-        Ok(Some(RestoredSnapshot::new(epoch, path, directory)))
+        Ok(Some(RestoredSnapshot::new(
+            epoch,
+            Some(stats.max_txid),
+            path,
+            directory,
+        )))
+    }
+
+    /// Highest durable transaction in one epoch, or `None` when it has no
+    /// restorable LTX. Used to finish a crash-interrupted import marker from
+    /// the lineage that was already validated before its owner CAS.
+    pub(crate) async fn epoch_max_txid(
+        &self,
+        cell: &str,
+        epoch: u64,
+    ) -> anyhow::Result<Option<u64>> {
+        let plan = match replica::calc_restore_plan(&self.client_for(cell, epoch), TXID(0)).await {
+            Ok(plan) => plan,
+            Err(celld_ltx::Error::TxNotAvailable) => return Ok(None),
+            Err(error) => {
+                return Err(anyhow!(error))
+                    .with_context(|| format!("plan durable position for {cell} e{epoch}"));
+            }
+        };
+        Ok(plan.iter().map(|info| info.max_txid.0).max())
+    }
+
+    /// Replace the private epoch used by an offline import, capture the input
+    /// as LTX, and prove that the uploaded lineage restores cleanly.
+    ///
+    /// Authority policy lives in `cell_archive`: this primitive is called only
+    /// while a CAS-created staging marker blocks activation and before an owner
+    /// record exists. Clearing the epoch makes a retry after a process crash
+    /// deterministic instead of appending to an unknown partial upload.
+    pub(crate) async fn seed_import_epoch(
+        &self,
+        cell: &str,
+        epoch: u64,
+        source: &Path,
+    ) -> anyhow::Result<u64> {
+        use celld_ltx::object_store::path::Path as ObjPath;
+
+        let remote_prefix = format!("{}cells/{cell}/ltx/e{epoch}", self.prefix);
+        let remote = ObjPath::from(remote_prefix.clone());
+        let mut listed = self.store.list(Some(&remote));
+        while let Some(object) = futures_util::StreamExt::next(&mut listed).await {
+            let object = object.context("list partial import epoch")?;
+            self.store
+                .delete(&object.location)
+                .await
+                .with_context(|| format!("clear partial import object {}", object.location))?;
+        }
+
+        let directory = self.watch.join(format!(".import-{cell}-e{epoch}"));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join("db.sqlite");
+        sqlite_snapshot(source, &path).context("create consistent import snapshot")?;
+
+        let client = self.client_for(cell, epoch);
+        let path_for_capture = path.clone();
+        let mut replica = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let mut db = Db::open(&path_for_capture).context("open import snapshot for LTX")?;
+            db.sync().context("capture import snapshot as LTX")?;
+            Ok(Replica::new(db, client))
+        })
+        .await??;
+        replica.sync().await.context("upload import snapshot LTX")?;
+        let txid = replica.pos().txid.0;
+        anyhow::ensure!(txid > 0, "import produced no durable LTX transaction");
+        drop(replica);
+
+        let restored = directory.join("roundtrip.sqlite");
+        replica::restore_with_download_slots(
+            &self.client_for(cell, epoch),
+            &restored,
+            TXID(0),
+            self.restore_slots.clone(),
+        )
+        .await
+        .context("round-trip imported LTX")?;
+        let connection = rusqlite::Connection::open_with_flags(
+            &restored,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let integrity: String =
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            integrity == "ok",
+            "import round-trip integrity check failed: {integrity}"
+        );
+        drop(connection);
+        let expected = directory.join("expected.sqlite");
+        let actual = directory.join("actual.sqlite");
+        sqlite_snapshot(&path, &expected).context("normalize captured import for comparison")?;
+        sqlite_snapshot(&restored, &actual).context("normalize restored import for comparison")?;
+        anyhow::ensure!(
+            files_equal(&expected, &actual)?,
+            "import LTX round trip does not match the staged SQLite database"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+        Ok(txid)
     }
 
     pub fn prune_local_cache(&self, max_bytes: u64) -> (usize, usize, u64) {
@@ -1068,6 +1171,26 @@ impl LtxRepl {
     /// long as celld is running.
     pub fn process_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
         Ok(None)
+    }
+}
+
+fn files_equal(left: &Path, right: &Path) -> std::io::Result<bool> {
+    if std::fs::metadata(left)?.len() != std::fs::metadata(right)?.len() {
+        return Ok(false);
+    }
+    let mut left = BufReader::new(std::fs::File::open(left)?);
+    let mut right = BufReader::new(std::fs::File::open(right)?);
+    let mut left_buffer = [0_u8; 64 * 1024];
+    let mut right_buffer = [0_u8; 64 * 1024];
+    loop {
+        let left_read = left.read(&mut left_buffer)?;
+        let right_read = right.read(&mut right_buffer)?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
     }
 }
 

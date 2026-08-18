@@ -195,6 +195,30 @@ impl BucketOwnership {
         }))
     }
 
+    /// Read authority while admitting a cold activation or reconciling an
+    /// acquisition. Import markers are checked only on this path so ordinary
+    /// output-gate proofs and releases do not add an object-store request.
+    pub async fn read_owner_for_activation(
+        &self,
+        cell: &str,
+    ) -> anyhow::Result<Option<OwnerRecord>> {
+        crate::cell_archive::ensure_import_ready(&self.bucket, cell).await?;
+        self.read_owner(cell).await
+    }
+
+    /// Publish the initial unowned record for a fully staged import.
+    ///
+    /// This is deliberately absent-only. Import must never replace, rewind,
+    /// or join an existing authority lineage.
+    pub async fn create_import_owner(&self, cell: &str, epoch: u64) -> anyhow::Result<CasOutcome> {
+        let key = format!("cells/{cell}/own.json");
+        let body = serde_json::to_vec(&OwnerWire { node: "", epoch })?;
+        match self.bucket.put_cas(&key, body, None).await? {
+            Some(_) => Ok(CasOutcome::Applied),
+            None => Ok(CasOutcome::Rejected),
+        }
+    }
+
     pub async fn read_node_lease(&self, owner: &str) -> anyhow::Result<Option<NodeLeaseRecord>> {
         load_node_lease(&self.bucket, owner).await
     }
@@ -420,5 +444,50 @@ fn process_load(live: &LiveLoad) -> NodeLoadWire {
         pressured: live.pressured.load(Ordering::Relaxed),
         shed_cells: live.shed_cells.load(Ordering::Relaxed),
         restoring: live.restoring.load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BucketOwnership;
+    use crate::bucket::Bucket;
+
+    #[tokio::test]
+    async fn staging_import_marker_blocks_activation_only() {
+        let bucket = Bucket::memory_for_test();
+        bucket
+            .put(
+                "cells/Knowledge:test/import.json",
+                br#"{
+                    "version": 1,
+                    "phase": "staging",
+                    "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "attempt_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "attempt_expires_ms": 1
+                }"#
+                .to_vec(),
+            )
+            .await
+            .unwrap();
+        let ownership = BucketOwnership::new(
+            bucket.clone(),
+            bucket,
+            "node.test".to_string(),
+            "probe-key".to_string(),
+        );
+
+        assert!(ownership
+            .read_owner("Knowledge:test")
+            .await
+            .unwrap()
+            .is_none());
+        let error = ownership
+            .read_owner_for_activation("Knowledge:test")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("incomplete offline import"),
+            "unexpected error: {error:#}"
+        );
     }
 }

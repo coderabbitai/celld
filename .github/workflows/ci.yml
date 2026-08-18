@@ -25,4 +25,6 @@ jobs:
       - name: Build the tested production image
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
-          docker build --build-arg CELLD_COMMIT="$GITHUB_SHA" --build-arg CELLD_VERSION="$version" .
+          docker build --tag celld-ci --build-arg CELLD_COMMIT="$GITHUB_SHA" --build-arg CELLD_VERSION="$version" .
+      - name: Test cell disaster recovery against MinIO
+        run: ./scripts/cell-archive-minio.sh

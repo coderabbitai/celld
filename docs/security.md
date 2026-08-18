@@ -73,6 +73,9 @@ alpha interface, so a release can change its paths or response formats.
 
 - `/state` reports the current occupancy, eviction, and restoration values. It
   remains available while a graceful shutdown drains existing work.
+- `/metrics` reports the same node lifecycle state as bounded Prometheus text.
+  It includes no cell, request, tenant, or bucket identifiers and remains
+  available during graceful drain.
 - `/cell/NAME` resolves or activates a cell for an operator check.
 - `/evict/NAME` evicts a resident cell.
 - `/do/NAME` sends a direct Durable Object request.

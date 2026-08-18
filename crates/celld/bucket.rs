@@ -154,6 +154,18 @@ fn split_spec(spec: &str) -> (StorageBackend, &str, String) {
 }
 
 impl Bucket {
+    #[cfg(test)]
+    pub(crate) fn memory_for_test() -> Bucket {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        Bucket {
+            store: store.clone(),
+            cas_store: store,
+            backend: StorageBackend::S3,
+            name: "memory".to_string(),
+            prefix: String::new(),
+        }
+    }
+
     /// `bucket` is `[s3://|gs://]NAME[/PREFIX]`. With a PREFIX every key
     /// this client reads or writes lives under `PREFIX/`, so several
     /// fleets can share one bucket without colliding.
