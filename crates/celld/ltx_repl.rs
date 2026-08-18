@@ -1124,6 +1124,10 @@ impl LtxRepl {
             &restored,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
         )?;
+        anyhow::ensure!(
+            !connection.is_readonly(rusqlite::DatabaseName::Main)?,
+            "import round-trip validation copy opened read-only"
+        );
         let integrity: String =
             connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         anyhow::ensure!(
