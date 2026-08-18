@@ -100,11 +100,34 @@ object_put() {
 
 object_prefix_exists() {
 	local prefix="$1"
+	local output
+	local root
+	local status
 	if [[ "$BACKEND" == 'minio' ]]; then
-		[[ -n "$(mc "mc find local/celld-archive/fleet/$prefix" 2>/dev/null)" ]]
+		root='local/celld-archive/fleet'
+		if output="$(mc "mc find $root" 2>&1)"; then
+			:
+		else
+			status=$?
+			printf '%s\n' "$output" >&2
+			exit "$status"
+		fi
 	else
-		gcloud storage ls --recursive "gs://$GCS_BUCKET/fleet/$prefix/**" >/dev/null 2>&1
+		root="gs://$GCS_BUCKET/fleet"
+		if output="$(gcloud storage ls --recursive "$root/**" 2>&1)"; then
+			:
+		else
+			status=$?
+			printf '%s\n' "$output" >&2
+			exit "$status"
+		fi
 	fi
+	while IFS= read -r object; do
+		if [[ "$object" == "$root/$prefix" || "$object" == "$root/$prefix/"* ]]; then
+			return 0
+		fi
+	done <<< "$output"
+	return 1
 }
 
 if [[ "$BACKEND" == 'minio' ]]; then
