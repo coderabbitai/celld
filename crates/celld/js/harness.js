@@ -3026,9 +3026,19 @@ class DurableObjectNamespace {
         const headersJson = req._headersJson !== undefined
           ? req._headersJson
           : JSON.stringify(Array.from(req.headers));
+        // A response control header (checkpoint publication today, and other
+        // host-owned transitions in the future) must cross the host dispatcher:
+        // that is where celld consumes the instruction and replaces it with the
+        // verified result headers. The owned fast path deliberately bypasses
+        // that boundary, so callers opt this rare operation out without slowing
+        // ordinary resident-cell traffic. Header names have already been
+        // normalized by Request/Headers; a quoted value cannot spoof this JSON
+        // token because JSON escapes its quotes.
+        const hostDispatch = headersJson.includes(
+          '"x-celld-host-dispatch"');
         // Fast path: this isolate owns the target cell — run the DO
         // in-isolate, avoiding the __do_call host round trip.
-        if (__cell.owned[scope]) {
+        if (__cell.owned[scope] && !hostDispatch) {
           return await invoke(() => __dispatchTo(
             scope, req.url, req.method, body_,
             headersJson,
