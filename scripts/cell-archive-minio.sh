@@ -163,6 +163,11 @@ connection.executemany(
     "INSERT INTO facts(body) VALUES (?)",
     [("durable knowledge",), ("second fact",)],
 )
+connection.execute("CREATE VIRTUAL TABLE knowledge_fts USING fts5(body)")
+connection.executemany(
+    "INSERT INTO knowledge_fts(body) VALUES (?)",
+    [("durable searchable knowledge",), ("second searchable fact",)],
+)
 connection.commit()
 connection.close()
 PY
@@ -205,8 +210,12 @@ database = os.path.join(root, "export.sqlite")
 manifest_path = database + ".manifest.json"
 connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
 rows = connection.execute("SELECT body FROM facts ORDER BY id").fetchall()
+search_rows = connection.execute(
+    "SELECT body FROM knowledge_fts WHERE knowledge_fts MATCH 'durable'"
+).fetchall()
 connection.close()
 assert rows == [("durable knowledge",), ("second fact",)]
+assert search_rows == [("durable searchable knowledge",)]
 with open(database, "rb") as file:
     digest = hashlib.sha256(file.read()).hexdigest()
 with open(manifest_path, encoding="utf-8") as file:

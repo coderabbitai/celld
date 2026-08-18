@@ -534,8 +534,15 @@ fn validate_sqlite(path: &Path) -> anyhow::Result<()> {
         "SQLite archive does not exist: {}",
         path.display()
     );
+    // Both callers pass a Celld-owned private snapshot: export validates the
+    // new output file and import validates its normalized copy, never the
+    // operator's source database. SQLite's FTS5 integrity hook needs a writable
+    // handle while checking the inverted index even though the check does not
+    // mutate application content. READ_ONLY therefore rejects a valid
+    // production cell with "attempt to write a readonly database". Keep CREATE
+    // absent so a missing archive still fails closed.
     let connection =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     anyhow::ensure!(
         integrity == "ok",
@@ -659,7 +666,12 @@ mod tests {
         let path = directory.path().join("archive.sqlite");
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("CREATE TABLE values_ (value TEXT); INSERT INTO values_ VALUES ('ok');")
+            .execute_batch(
+                "CREATE TABLE values_ (value TEXT);
+                 INSERT INTO values_ VALUES ('ok');
+                 CREATE VIRTUAL TABLE knowledge_fts USING fts5(body);
+                 INSERT INTO knowledge_fts VALUES ('durable searchable knowledge');",
+            )
             .unwrap();
         drop(connection);
         validate_sqlite(&path).unwrap();
