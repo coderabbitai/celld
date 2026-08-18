@@ -322,8 +322,7 @@ async fn export(cell: &str, output: &Path, storage: &StorageOptions) -> anyhow::
         database_sha256: sha256_file(&staged_database)?,
     };
     write_private_new(&staged_manifest, &serde_json::to_vec_pretty(&manifest)?)?;
-    publish_private_file(&staged_database, output)?;
-    publish_private_file(&staged_manifest, &manifest_path)?;
+    publish_archive_files(&staged_database, output, &staged_manifest, &manifest_path)?;
     sync_directory(output_directory)?;
     println!(
         "exported {cell} epoch {} to {}",
@@ -622,6 +621,43 @@ fn publish_private_file(source: &Path, destination: &Path) -> anyhow::Result<()>
     })
 }
 
+fn publish_archive_files(
+    database_source: &Path,
+    database_destination: &Path,
+    manifest_source: &Path,
+    manifest_destination: &Path,
+) -> anyhow::Result<()> {
+    publish_private_file(database_source, database_destination)?;
+    if let Err(error) = publish_private_file(manifest_source, manifest_destination) {
+        if paths_reference_same_file(database_source, database_destination)? {
+            std::fs::remove_file(database_destination).with_context(|| {
+                format!(
+                    "remove partially published database {}",
+                    database_destination.display()
+                )
+            })?;
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn paths_reference_same_file(left: &Path, right: &Path) -> anyhow::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = std::fs::metadata(left)?;
+    let right = std::fs::metadata(right)?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn paths_reference_same_file(_left: &Path, _right: &Path) -> anyhow::Result<bool> {
+    // Celld release targets are Unix. On another platform, fail safely by
+    // preserving a partial database rather than deleting an unverified path.
+    Ok(false)
+}
+
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> anyhow::Result<()> {
     std::fs::File::open(path)?.sync_all()?;
@@ -751,6 +787,31 @@ mod tests {
         std::fs::write(&destination, b"existing").unwrap();
         assert!(publish_private_file(&source, &destination).is_err());
         assert_eq!(std::fs::read(&destination).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn manifest_collision_rolls_back_the_published_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_source = directory.path().join("staged-database");
+        let database_destination = directory.path().join("archive.sqlite");
+        let manifest_source = directory.path().join("staged-manifest");
+        let manifest_destination = directory.path().join("archive.sqlite.manifest.json");
+        std::fs::write(&database_source, b"validated database").unwrap();
+        std::fs::write(&manifest_source, b"validated manifest").unwrap();
+        std::fs::write(&manifest_destination, b"existing manifest").unwrap();
+
+        assert!(publish_archive_files(
+            &database_source,
+            &database_destination,
+            &manifest_source,
+            &manifest_destination,
+        )
+        .is_err());
+        assert!(!database_destination.exists());
+        assert_eq!(
+            std::fs::read(&manifest_destination).unwrap(),
+            b"existing manifest"
+        );
     }
 
     #[test]
